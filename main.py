@@ -6,6 +6,7 @@ pip install PyQt6 pygame mutagen sounddevice
 import sys
 import os
 import json
+import math
 import time
 import random
 import threading
@@ -14,11 +15,12 @@ from pathlib import Path
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QPushButton, QListWidget, QListWidgetItem,
-    QLineEdit, QComboBox, QFileDialog, QMessageBox, QMenu, QSlider,
+    QLineEdit, QComboBox, QFileDialog, QMessageBox, QMenu,
     QTabWidget, QSizePolicy, QFrame, QScrollArea,
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QMimeData, QUrl
-from PyQt6.QtGui import QPainter, QColor, QLinearGradient, QRadialGradient, QFont, QDragEnterEvent, QDropEvent
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QMimeData, QUrl, QPointF, QRectF
+from PyQt6.QtGui import (QPainter, QColor, QLinearGradient, QRadialGradient, QFont,
+                         QDragEnterEvent, QDropEvent, QPolygonF)
 
 # ── Optional backends ─────────────────────────────────────────────────────────
 try:
@@ -42,33 +44,33 @@ except Exception:
     HAS_MUTAGEN = False
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-AUDIO_EXTENSIONS = {'.mp3', '.wav', '.flac', '.ogg', '.aac', '.m4a', '.wma', '.opus'}
-FORMATS_FILTER = "Áudio (*.mp3 *.wav *.flac *.ogg *.aac *.m4a *.wma *.opus);;Todos (*.*)"
+AUDIO_EXTENSIONS = {'.mp3', '.mpa', '.wav', '.flac', '.ogg', '.aac', '.m4a', '.wma', '.opus', '.mp2', '.mp4'}
+FORMATS_FILTER = "Áudio (*.mp3 *.mpa *.wav *.flac *.ogg *.aac *.m4a *.wma *.opus *.mp2 *.mp4);;Todos (*.*)"
 
 C = {
-    'bg':        '#0e1117',
-    'panel':     '#141824',
-    'panel2':    '#1a2030',
-    'header':    '#111827',
-    'border':    '#1e2a3d',
-    'border2':   '#2a3a55',
-    'accent':    '#2563eb',
-    'accent2':   '#1d4ed8',
-    'accent_lt': '#3b82f6',
-    'text':      '#d1d5db',
-    'text_dim':  '#6b7280',
-    'playing':   '#22d3ee',
-    'hover':     '#1e2d47',
-    'sel':       '#1e3a5f',
-    'vu_green':  '#22c55e',
-    'vu_yellow': '#eab308',
-    'vu_red':    '#ef4444',
+    'bg':        '#111111',
+    'panel':     '#1a1a1a',
+    'panel2':    '#202020',
+    'header':    '#0d0d0d',
+    'border':    '#2a2a2a',
+    'border2':   '#383838',
+    'accent':    '#1464b4',
+    'accent2':   '#0d4f9e',
+    'accent_lt': '#1878d4',
+    'text':      '#ffffff',
+    'text_dim':  '#888888',
+    'playing':   '#00dd55',
+    'hover':     '#1a2a3a',
+    'sel':       '#1464b4',
+    'vu_green':  '#00bb44',
+    'vu_yellow': '#ddaa00',
+    'vu_red':    '#dd2222',
 }
 
 PANEL_HEADERS = [
-    '#1e3a5f', '#1a3550', '#162d44',
-    '#1e3a5f', '#1a3550', '#162d44',
-    '#1e3a5f', '#1a3550', '#162d44',
+    '#002d6b', '#002d6b', '#002d6b',
+    '#002d6b', '#002d6b', '#002d6b',
+    '#002d6b', '#002d6b', '#002d6b',
 ]
 
 DATA_FILE = Path.home() / '.djmixplayer' / 'playlists.json'
@@ -88,19 +90,22 @@ def get_duration(path: str) -> str:
 
 
 def display_name(path: str) -> str:
+    name = ''
     if HAS_MUTAGEN:
         try:
             f = MutagenFile(path, easy=True)
             if f:
-                title = f.get('title', [''])[0]
+                title  = f.get('title',  [''])[0]
                 artist = f.get('artist', [''])[0]
                 if title and artist:
-                    return f"{artist} — {title}"
-                if title:
-                    return title
+                    name = f"{artist} — {title}"
+                elif title:
+                    name = title
         except Exception:
             pass
-    return Path(path).stem
+    if not name:
+        name = Path(path).stem
+    return name.upper()
 
 
 # ── Audio Engine ──────────────────────────────────────────────────────────────
@@ -131,33 +136,42 @@ class AudioEngine(QObject):
         self._tick_timer.start()
 
     # ── public API ─────────────────────────────────────────────────────────
-    def load(self, path: str):
-        self._path = path
+    def load(self, path: str) -> bool:
+        self._path = None
+        self._duration = 0
         if HAS_PYGAME:
             try:
                 pygame.mixer.music.load(path)
-                self._duration = 0
+                self._path = path
                 if HAS_MUTAGEN:
                     f = MutagenFile(path)
                     if f and hasattr(f.info, 'length'):
                         self._duration = int(f.info.length)
                 self.sig_dur.emit(self._duration)
+                return True
             except Exception as e:
-                print(f"load error: {e}")
+                self.sig_state.emit('stopped')
+                raise RuntimeError(str(e))
+        return False
 
     def play(self):
         if not self._path:
             return
         if HAS_PYGAME:
-            if self._state == 'paused':
-                pygame.mixer.music.unpause()
-                self._t0 = time.time()
-            else:
-                pygame.mixer.music.play()
-                self._t0 = time.time()
-                self._offset = 0.0
-            self._state = 'playing'
-            self.sig_state.emit('playing')
+            try:
+                if self._state == 'paused':
+                    pygame.mixer.music.unpause()
+                    self._t0 = time.time()
+                else:
+                    pygame.mixer.music.play()
+                    self._t0 = time.time()
+                    self._offset = 0.0
+                self._state = 'playing'
+                self.sig_state.emit('playing')
+            except Exception as e:
+                print(f"play error: {e}")
+                self._state = 'stopped'
+                self.sig_state.emit('stopped')
 
     def pause(self):
         if HAS_PYGAME and self._state == 'playing':
@@ -257,76 +271,227 @@ class AudioEngine(QObject):
     def duration(self): return self._duration
 
 
-# ── VU Meter ──────────────────────────────────────────────────────────────────
+# ── VU Meter Analógico ────────────────────────────────────────────────────────
 class VUMeter(QWidget):
+    """
+    Arco CCW de 180° (esq/9h) até 360°/0° (dir/3h) passando pelo topo (270°).
+    Nível 0 = agulha à esquerda, nível 1 = agulha à direita.
+    Convenção de ângulos Qt: 0°=3h, CCW positivo, 270°=12h(topo).
+    Convenção do ponteiro: ângulo padrão = 180 - nível*180, Y invertido.
+    """
     def __init__(self, ch='L', parent=None):
         super().__init__(parent)
-        self.ch = ch
+        self.ch    = ch
         self._lvl  = 0.0
         self._peak = 0.0
         self._hold = 0
-        self.setMinimumWidth(32)
-        self.setMaximumWidth(44)
+        self.setMinimumSize(140, 120)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def set_level(self, v: float):
+        self._lvl = max(0.0, min(1.0, v))
+        if self._lvl > self._peak:
+            self._peak = self._lvl
+            self._hold = 25
+        else:
+            if self._hold > 0:
+                self._hold -= 1
+            else:
+                self._peak = max(0.0, self._peak - 0.012)
+        self.update()
+
+    def paintEvent(self, _):
+        from PyQt6.QtGui import QPen
+
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+
+        p.fillRect(0, 0, w, h, QColor(C['bg']))
+
+        margin = 8
+        cx = w / 2.0
+        cy = float(h - margin)
+        # r + ARC_W deve caber dentro de cx; com ARC_W ≈ r/5 → r ≤ (cx-2)*5/6
+        r     = int(min((cx - 2) * 5.0 / 6.0, cy - 4))
+        ARC_W = max(6, r // 5)
+        r_mid = r - ARC_W // 2
+
+        # Face do medidor
+        cxi, cyi = int(cx), int(cy)
+        p.setPen(QPen(QColor('#2a2a2a'), 2))
+        p.setBrush(QColor('#111820'))
+        p.drawEllipse(cxi - r - ARC_W, cyi - r - ARC_W,
+                      (r + ARC_W) * 2, (r + ARC_W) * 2)
+
+        # ── helper: desenha arco em convenção Qt ──────────────────────────
+        # start_deg e span_deg em graus Qt (CCW a partir de 3h)
+        def arc(start_deg, span_deg, color, alpha=255):
+            col = QColor(color); col.setAlpha(alpha)
+            p.setPen(QPen(col, ARC_W, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap))
+            p.drawArc(cxi - r_mid, cyi - r_mid, r_mid * 2, r_mid * 2,
+                      int(start_deg * 16), int(span_deg * 16))
+
+        # ── Zonas de fundo (escala 0-100-140) ────────────────────────────
+        # Verde: 0→100  = 100/140 × 180° = 128.6° ≈ 129°
+        # Amarelo: 100→120 = 20/140 × 180° = 25.7° ≈ 26°
+        # Vermelho: 120→140 = 20/140 × 180° = 25.4° ≈ 25°
+        G_SPAN, Y_SPAN, R_SPAN = 129, 26, 25  # total = 180°
+        arc(180,             G_SPAN, C['vu_green'],  55)
+        arc(180 + G_SPAN,    Y_SPAN, C['vu_yellow'], 55)
+        arc(180 + G_SPAN + Y_SPAN, R_SPAN, C['vu_red'], 55)
+
+        # ── Zonas preenchidas até o nível atual ───────────────────────────
+        sweep = self._lvl * 180
+        g_fill = min(sweep, G_SPAN)
+        if g_fill > 0:
+            arc(180, g_fill, C['vu_green'], 255)
+            sweep -= g_fill
+        y_fill = min(sweep, Y_SPAN)
+        if y_fill > 0:
+            arc(180 + G_SPAN, y_fill, C['vu_yellow'], 255)
+            sweep -= y_fill
+        r_fill = min(sweep, R_SPAN)
+        if r_fill > 0:
+            arc(180 + G_SPAN + Y_SPAN, r_fill, C['vu_red'], 255)
+
+        # ── Marcações e números (escala 0, 20, 40, 60, 80, 100, 120, 140) ─
+        SCALE_MAX = 140
+        ticks = [(v, v % 40 == 0 or v == 100) for v in range(0, 141, 20)]
+        for val, major in ticks:
+            pct = val / SCALE_MAX
+            a  = math.radians(180 - pct * 180)
+            ca, sa = math.cos(a), math.sin(a)
+            tick_len = 9 if major else 5
+            ri = r - ARC_W - 1
+            x1 = cxi + int(ri * ca);            y1 = cyi - int(ri * sa)
+            x2 = cxi + int((ri - tick_len) * ca); y2 = cyi - int((ri - tick_len) * sa)
+            p.setPen(QPen(QColor('#666666' if major else '#404040'), 1))
+            p.drawLine(x1, y1, x2, y2)
+            if major:
+                # Labels fora do arco (entre arco e borda do widget)
+                outer_r = r + ARC_W // 2 + 3
+                lbl_r   = min(outer_r, int(cx) - 13)
+                lx = cxi + int(lbl_r * ca) - 10
+                # levanta labels horizontais para não colarem na borda inferior
+                lift = int((1.0 - abs(sa)) * 9)
+                ly = cyi - int(lbl_r * sa) - 7 - lift
+                p.setPen(QColor('#aaaaaa' if val != 100 else '#ddaa00'))
+                p.setFont(QFont('Ubuntu', max(5, r // 12), QFont.Weight.Bold))
+                p.drawText(lx, ly, 20, 14, Qt.AlignmentFlag.AlignCenter, str(val))
+
+        # ── Peak hold ─────────────────────────────────────────────────────
+        if self._peak > 0.02:
+            pa = math.radians(180 - self._peak * 180)
+            pk_c = (C['vu_red'] if self._peak > 0.85 else
+                    C['vu_yellow'] if self._peak > 0.65 else C['vu_green'])
+            p.setPen(QPen(QColor(pk_c), 2))
+            px1 = cxi + int((r - ARC_W - 2) * math.cos(pa))
+            py1 = cyi - int((r - ARC_W - 2) * math.sin(pa))
+            px2 = cxi + int((r - ARC_W - 12) * math.cos(pa))
+            py2 = cyi - int((r - ARC_W - 12) * math.sin(pa))
+            p.drawLine(px1, py1, px2, py2)
+
+        # ── Agulha principal ──────────────────────────────────────────────
+        na = math.radians(180 - self._lvl * 180)
+        nx = cxi + int((r - ARC_W - 4) * math.cos(na))
+        ny = cyi - int((r - ARC_W - 4) * math.sin(na))
+        p.setPen(QPen(QColor('white'), 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        p.drawLine(cxi, cyi, nx, ny)
+
+        # Hub
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor('#cccccc'))
+        p.drawEllipse(cxi - 4, cyi - 4, 8, 8)
+
+        # Label
+        p.setPen(QColor('#aaaaaa'))
+        p.setFont(QFont('Ubuntu', 8, QFont.Weight.Bold))
+        p.drawText(0, cyi - r // 2, w, r // 2,
+                   Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                   self.ch)
+        p.end()
+
+
+# ── Digital VU Bar (segmentos verticais) ─────────────────────────────────────
+class DigitalVUBar(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._lvl  = 0.0
+        self._peak = 0.0
+        self._hold = 0
+        self.setFixedWidth(16)
+        self.setMinimumHeight(80)
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
 
     def set_level(self, v: float):
         self._lvl = max(0.0, min(1.0, v))
         if self._lvl > self._peak:
             self._peak = self._lvl
-            self._hold = 22
+            self._hold = 28
         else:
             if self._hold > 0:
                 self._hold -= 1
             else:
-                self._peak = max(0.0, self._peak - 0.015)
+                self._peak = max(0.0, self._peak - 0.010)
         self.update()
 
     def paintEvent(self, _):
         p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h = self.width(), self.height()
-        SEGS = 28
-        label_h = 18
-        bar_h = h - label_h - 4
-        seg_h = max(3, (bar_h - SEGS) // SEGS)
-        gap   = 1
-
         p.fillRect(0, 0, w, h, QColor(C['bg']))
 
-        filled   = int(self._lvl  * SEGS)
-        peak_seg = int(self._peak * SEGS)
+        SEG, GAP = 3, 1
+        STEP  = SEG + GAP
+        total = max(1, h // STEP)
+        lit   = int(self._lvl * total)
 
-        for i in range(SEGS):
-            y = 2 + bar_h - (i + 1) * (seg_h + gap)
-            frac = i / SEGS
-            if   frac > 0.86: color = QColor(C['vu_red'])
-            elif frac > 0.65: color = QColor(C['vu_yellow'])
-            else:              color = QColor(C['vu_green'])
-
-            if i < filled:
-                p.fillRect(5, y, w - 10, seg_h, color)
+        for i in range(total):
+            pct = i / total
+            color = (C['vu_red'] if pct >= 0.85 else
+                     C['vu_yellow'] if pct >= 0.65 else C['vu_green'])
+            y = h - (i + 1) * STEP
+            if i < lit:
+                p.fillRect(1, y, w - 2, SEG, QColor(color))
             else:
                 dim = QColor(color); dim.setAlpha(30)
-                p.fillRect(5, y, w - 10, seg_h, dim)
+                p.fillRect(1, y, w - 2, SEG, dim)
 
-        # Peak hold bar
-        if 0 < peak_seg < SEGS:
-            py = 2 + bar_h - (peak_seg + 1) * (seg_h + gap)
-            frac = peak_seg / SEGS
-            if   frac > 0.86: pc = QColor(C['vu_red'])
-            elif frac > 0.65: pc = QColor(C['vu_yellow'])
-            else:              pc = QColor(C['vu_green'])
-            pc.setAlpha(240)
-            p.fillRect(5, py, w - 10, 2, pc)
-
-        # Label
-        p.setPen(QColor(C['text_dim']))
-        f = QFont('Courier', 8, QFont.Weight.Bold)
-        p.setFont(f)
-        p.drawText(0, h - label_h, w, label_h,
-                   Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
-                   self.ch)
+        if self._peak > 0.02:
+            pk_i = min(int(self._peak * total), total - 1)
+            pk_y = h - (pk_i + 1) * STEP
+            pk_c = (C['vu_red'] if self._peak >= 0.85 else
+                    C['vu_yellow'] if self._peak >= 0.65 else C['vu_green'])
+            p.fillRect(1, pk_y, w - 2, SEG, QColor(pk_c))
         p.end()
+
+
+# ── Delegate: garante cor verde na música tocando em qualquer estado ──────────
+from PyQt6.QtWidgets import QStyledItemDelegate, QStyle
+from PyQt6.QtGui import QColor
+
+class SongDelegate(QStyledItemDelegate):
+    PLAYING_ROLE = Qt.ItemDataRole.UserRole + 2
+
+    def paint(self, painter, option, index):
+        playing = index.data(self.PLAYING_ROLE)
+        if playing:
+            painter.save()
+            # Fundo verde-escuro sempre, independente de seleção/foco
+            painter.fillRect(option.rect, QColor('#0a2a14'))
+            # Texto verde
+            painter.setPen(QColor('#00dd55'))
+            font = option.font
+            font.setBold(True)
+            painter.setFont(font)
+            painter.drawText(
+                option.rect.adjusted(8, 0, -4, 0),
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                index.data(Qt.ItemDataRole.DisplayRole) or ''
+            )
+            painter.restore()
+        else:
+            super().paint(painter, option, index)
 
 
 # ── Playlist List ─────────────────────────────────────────────────────────────
@@ -336,16 +501,25 @@ class PlaylistList(QListWidget):
 
 # ── Playlist Panel ────────────────────────────────────────────────────────────
 class SongItem(QListWidgetItem):
+    _PATH_ROLE   = Qt.ItemDataRole.UserRole
+    _NAME_ROLE   = Qt.ItemDataRole.UserRole + 1
+    _PLAYING_ROLE = Qt.ItemDataRole.UserRole + 2
+
     def __init__(self, path: str):
         super().__init__()
-        self.path = path
-        self._name = display_name(path)
-        self._dur  = get_duration(path)
-        self.setText(f"  {self._name}")
+        name = display_name(path)
+        self.setData(self._PATH_ROLE, path)
+        self.setData(self._NAME_ROLE, name)
+        self.setText(f"  {name}")
         self.setToolTip(path)
 
+    @property
+    def path(self) -> str:
+        return self.data(self._PATH_ROLE)
+
     def matches(self, q: str) -> bool:
-        return q in self._name.lower() or q in Path(self.path).name.lower()
+        name = self.data(self._NAME_ROLE)
+        return q in name.lower() or q in Path(self.path).name.lower()
 
 
 class PlaylistPanel(QWidget):
@@ -373,8 +547,8 @@ class PlaylistPanel(QWidget):
         hl.setContentsMargins(8, 0, 4, 0)
         hl.setSpacing(3)
 
-        self._lbl = QLabel(self._name)
-        self._lbl.setStyleSheet("color:white; font-weight:bold; font-size:10px; letter-spacing:1px;")
+        self._lbl = QLabel(self._name.upper())
+        self._lbl.setStyleSheet("color:white; font-weight:bold; font-size:13px; font-family:'Ubuntu','DejaVu Sans','Arial',sans-serif; letter-spacing:1px;")
         self._lbl.mouseDoubleClickEvent = lambda _: self._rename()
         self._lbl.setCursor(Qt.CursorShape.IBeamCursor)
         self._lbl.setToolTip('Duplo clique para renomear')
@@ -414,7 +588,8 @@ class PlaylistPanel(QWidget):
         self._list = PlaylistList()
         self._list.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self._list.setFont(QFont('Segoe UI', 11, QFont.Weight.Medium))
+        self._list.setFont(QFont('Ubuntu', 13, QFont.Weight.Bold))
+        self._list.setItemDelegate(SongDelegate())
         self._apply_list_style(active=False)
         self._list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._list.customContextMenuRequested.connect(self._ctx)
@@ -423,42 +598,71 @@ class PlaylistPanel(QWidget):
         layout.addWidget(self._list)
 
     def _apply_list_style(self, active: bool):
-        border_color = C['accent_lt'] if active else C['border']
-        bg_color     = '#17203a'      if active else C['panel']
+        if active:
+            bg_color     = '#0d3a7a'
+            border_color = '#1565c0'
+            text_color   = '#ffffff'
+            sel_color    = '#1976d2'
+            hover_color  = '#1565c0'
+            item_border  = 'rgba(255,255,255,.12)'
+            scroll_bg    = '#0a2a5e'
+            scroll_hdl   = '#1878d4'
+        else:
+            bg_color     = '#111827'
+            border_color = '#1e3a5f'
+            text_color   = '#d1d5db'
+            sel_color    = '#1e3a5f'
+            hover_color  = '#1a2d47'
+            item_border  = 'rgba(255,255,255,.06)'
+            scroll_bg    = '#0d1525'
+            scroll_hdl   = '#1464b4'
+
         self._list.setStyleSheet(f"""
             QListWidget{{
                 background:{bg_color};
-                border:2px solid {border_color};
+                border:1px solid {border_color};
                 border-top:none;
-                border-radius:0 0 5px 5px;
-                color:{C['text']};
+                border-radius:0 0 3px 3px;
+                color:{text_color};
+                font-family:'Ubuntu','DejaVu Sans','Arial',sans-serif;
                 font-size:13px;
+                font-weight:bold;
                 outline:none;
             }}
             QListWidget::item{{
-                height:28px;
-                padding-left:6px;
-                border-bottom:1px solid rgba(255,255,255,.05);
+                height:22px;
+                padding-left:4px;
+                border-bottom:1px solid {item_border};
             }}
-            QListWidget::item:selected{{background:{C['sel']};color:white;}}
-            QListWidget::item:hover{{background:{C['hover']};}}
+            QListWidget::item:selected{{background:{sel_color};}}
+            QListWidget::item:selected:active{{background:{sel_color};}}
+            QListWidget::item:hover{{background:{hover_color};}}
+            QListWidget::item:focus{{outline:none;}}
             QScrollBar:vertical{{
-                background:{C['bg']};width:5px;border-radius:2px;
+                background:{scroll_bg};
+                width:12px;
+                border-radius:4px;
+                margin:2px;
             }}
             QScrollBar::handle:vertical{{
-                background:{C['border2']};border-radius:2px;min-height:20px;
+                background:{scroll_hdl};
+                border-radius:4px;
+                min-height:24px;
+            }}
+            QScrollBar::handle:vertical:hover{{
+                background:#1e90ff;
             }}
             QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{{height:0;}}
         """)
 
     def set_active(self, active: bool):
         self._apply_list_style(active)
-        # Header border glow
-        glow = f"2px solid {C['accent_lt']}" if active else f"2px solid {self._color}"
+        hdr_bg = '#1565c0' if active else self._color
         self._hdr.setStyleSheet(
-            f"background:{self._color};border-radius:5px 5px 0 0;"
-            f"border:{glow};"
+            f"background:{hdr_bg};border-radius:3px 3px 0 0;"
         )
+        self._list.update()
+        self._hdr.update()
 
     def _list_key_press(self, event):
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
@@ -506,7 +710,7 @@ class PlaylistPanel(QWidget):
             text=self._name
         )
         if ok and new_name.strip():
-            self._name = new_name.strip()
+            self._name = new_name.strip().upper()
             self._lbl.setText(self._name)
 
     def _clear(self):
@@ -568,12 +772,10 @@ class PlaylistPanel(QWidget):
         for i in range(self._list.count()):
             it = self._list.item(i)
             if it.path == path:
-                it.setForeground(QColor(C['playing']))
-                it.setFont(QFont('Segoe UI', 11, QFont.Weight.Bold))
+                it.setData(SongItem._PLAYING_ROLE, True)
                 has_playing = True
             else:
-                it.setForeground(QColor(C['text']))
-                it.setFont(QFont('Segoe UI', 11, QFont.Weight.Medium))
+                it.setData(SongItem._PLAYING_ROLE, False)
         self.set_active(has_playing)
 
     def to_dict(self)  -> dict: return {'name': self._name, 'songs': self._songs}
@@ -642,12 +844,15 @@ class TabPage(QWidget):
 
 # ── Transport Button (custom painted) ────────────────────────────────────────
 class TransportButton(QWidget):
+    """
+    Botão circular com ícone geométrico desenhado via QPainter.
+    icon: 'play' | 'stop' | 'pause' | 'prev' | 'next'
+    """
     clicked = pyqtSignal()
 
     def __init__(self, icon: str, size: int = 60, accent: bool = False, parent=None):
         super().__init__(parent)
         self._icon    = icon
-        self._sz      = size
         self._accent  = accent
         self._hovered = False
         self._pressed = False
@@ -655,56 +860,110 @@ class TransportButton(QWidget):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
     def paintEvent(self, _):
-        import math
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        w, h = self.width(), self.height()
-        cx, cy = w // 2, h // 2
-        r = min(w, h) // 2 - 4
+        w, h   = self.width(), self.height()
+        cx, cy = w / 2.0, h / 2.0
+        r      = min(w, h) / 2.0 - 3.0
         if self._pressed:
-            r -= 2
+            r -= 1.5
 
-        # Outer glow when hovered
+        # --- glow externo ---
         if self._hovered:
             gc = QColor(C['accent_lt'] if self._accent else '#3a4a6a')
             for i in range(7, 0, -1):
-                gc.setAlpha(i * 8)
+                gc.setAlpha(i * 9)
                 p.setPen(Qt.PenStyle.NoPen)
                 p.setBrush(gc)
-                p.drawEllipse(cx - r - i, cy - r - i, (r + i) * 2, (r + i) * 2)
+                ri = r + i
+                p.drawEllipse(QRectF(cx - ri, cy - ri, ri * 2, ri * 2))
 
-        # Circle fill
+        # --- fundo do círculo ---
         p.setPen(Qt.PenStyle.NoPen)
         if self._accent:
-            grad = QRadialGradient(cx, cy - r // 3, r * 1.2)
-            grad.setColorAt(0.0, QColor('#5ba3ff'))
-            grad.setColorAt(0.5, QColor(C['accent']))
+            grad = QRadialGradient(cx, cy - r * 0.35, r * 1.3)
+            grad.setColorAt(0.0, QColor('#6ab0ff'))
+            grad.setColorAt(0.45, QColor(C['accent']))
             grad.setColorAt(1.0, QColor(C['accent2']))
         else:
-            grad = QRadialGradient(cx, cy - r // 3, r * 1.2)
+            grad = QRadialGradient(cx, cy - r * 0.35, r * 1.3)
             grad.setColorAt(0.0, QColor('#2e3f5e'))
-            grad.setColorAt(1.0, QColor('#151d2e'))
+            grad.setColorAt(1.0, QColor('#111820'))
         p.setBrush(grad)
-        p.drawEllipse(cx - r, cy - r, r * 2, r * 2)
+        p.drawEllipse(QRectF(cx - r, cy - r, r * 2, r * 2))
 
-        # Border ring
-        pen_color = QColor(C['accent_lt'] if self._accent else C['border2'])
+        # --- borda ---
+        ring_color = QColor(C['accent_lt'] if self._accent else C['border2'])
         if self._hovered:
-            pen_color = QColor(C['accent_lt'])
-        p.setPen(pen_color)
+            ring_color = QColor(C['accent_lt'])
+        p.setPen(ring_color)
         p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawEllipse(cx - r, cy - r, r * 2, r * 2)
+        p.drawEllipse(QRectF(cx - r, cy - r, r * 2, r * 2))
 
-        # Icon text
-        icon_font_size = max(10, r // 2 + 4)
-        p.setPen(QColor('white'))
-        f = QFont('Segoe UI Symbol', icon_font_size)
-        f.setWeight(QFont.Weight.Bold)
-        p.setFont(f)
-        # Nudge ▶ slightly right for visual centering
-        offset = 2 if self._icon == '▶' else 0
-        p.drawText(offset, 0, w, h, Qt.AlignmentFlag.AlignCenter, self._icon)
+        # --- ícone geométrico ---
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor('white'))
+
+        if self._icon == 'play':
+            # Triângulo apontando para direita com centróide em (cx, cy)
+            s = r * 0.38
+            w_ = s * 1.8           # largura do triângulo
+            x0 = cx - w_ / 3.0    # base deslocada para centróide ficar em cx
+            tri = QPolygonF([
+                QPointF(x0,        cy - s),
+                QPointF(x0,        cy + s),
+                QPointF(x0 + w_,   cy),
+            ])
+            p.drawPolygon(tri)
+
+        elif self._icon == 'stop':
+            s = r * 0.33
+            p.drawRect(QRectF(cx - s, cy - s, s * 2, s * 2))
+
+        elif self._icon == 'pause':
+            bw = r * 0.18
+            bh = r * 0.48
+            gap = r * 0.14
+            p.drawRect(QRectF(cx - gap - bw, cy - bh, bw, bh * 2))
+            p.drawRect(QRectF(cx + gap,       cy - bh, bw, bh * 2))
+
+        elif self._icon == 'prev':
+            # Barra vertical + triângulo apontando para esquerda
+            s  = r * 0.28
+            bw = r * 0.13
+            gap = r * 0.06
+            bar_x = cx - s * 1.1 - bw / 2 - gap
+            p.drawRect(QRectF(bar_x, cy - s, bw, s * 2))
+            w_ = s * 1.5
+            x0 = bar_x + bw + gap * 2
+            tri = QPolygonF([
+                QPointF(x0 + w_,  cy - s),
+                QPointF(x0 + w_,  cy + s),
+                QPointF(x0,       cy),
+            ])
+            p.drawPolygon(tri)
+
+        elif self._icon == 'next':
+            # Triângulo apontando para direita + barra vertical
+            s  = r * 0.28
+            bw = r * 0.13
+            gap = r * 0.06
+            w_ = s * 1.5
+            x0 = cx - w_ / 3.0 - gap
+            tri = QPolygonF([
+                QPointF(x0,        cy - s),
+                QPointF(x0,        cy + s),
+                QPointF(x0 + w_,   cy),
+            ])
+            p.drawPolygon(tri)
+            bar_x = x0 + w_ + gap * 2
+            p.drawRect(QRectF(bar_x - bw / 2, cy - s, bw, s * 2))
+
         p.end()
+
+    def set_icon(self, icon: str):
+        self._icon = icon
+        self.update()
 
     def enterEvent(self, _):  self._hovered = True;  self.update()
     def leaveEvent(self, _):  self._hovered = False; self.update()
@@ -765,52 +1024,90 @@ class SeekBar(QWidget):
     def mouseReleaseEvent(self,e): self._drag = False; self._pos = self._frac(e); self.seeked.emit(self._pos); self.update()
 
 
+# ── Volume Slider (custom drawn — sem artefatos de plataforma) ────────────────
+class VolumeSlider(QWidget):
+    changed = pyqtSignal(float)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._val  = 0.8
+        self._drag = False
+        self.setFixedWidth(140)
+        self.setFixedHeight(18)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def set_value(self, v: float):
+        self._val = max(0.0, min(1.0, v))
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        cy = h // 2
+
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(C['border2']))
+        p.drawRoundedRect(0, cy - 2, w, 4, 2, 2)
+
+        fill = int(self._val * w)
+        if fill > 4:
+            g = QLinearGradient(0, 0, fill, 0)
+            g.setColorAt(0, QColor(C['accent2']))
+            g.setColorAt(1, QColor(C['accent_lt']))
+            p.setBrush(g)
+            p.drawRoundedRect(0, cy - 2, fill, 4, 2, 2)
+
+        kx = max(6, min(w - 6, int(self._val * w)))
+        p.setBrush(QColor('white'))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(kx - 6, cy - 6, 12, 12)
+        p.end()
+
+    def _frac(self, e) -> float:
+        return max(0.0, min(1.0, e.position().x() / self.width()))
+
+    def mousePressEvent(self,  e): self._drag = True;  self._val = self._frac(e); self.update(); self.changed.emit(self._val)
+    def mouseMoveEvent(self,   e):
+        if self._drag: self._val = self._frac(e); self.update(); self.changed.emit(self._val)
+    def mouseReleaseEvent(self,e): self._drag = False; self._val = self._frac(e); self.update(); self.changed.emit(self._val)
+
+
 # ── Transport Bar ─────────────────────────────────────────────────────────────
 class TransportBar(QWidget):
     sig_play   = pyqtSignal()
     sig_pause  = pyqtSignal()
     sig_stop   = pyqtSignal()
+    sig_prev   = pyqtSignal()
+    sig_next   = pyqtSignal()
     sig_seek   = pyqtSignal(float)
     sig_volume = pyqtSignal(float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._dur = 0
+        self._dur   = 0
+        self._state = 'stopped'
         self._build()
 
     def _build(self):
         root = QVBoxLayout(self)
-        root.setContentsMargins(20, 8, 20, 8)
-        root.setSpacing(4)
+        root.setContentsMargins(16, 4, 16, 4)
+        root.setSpacing(3)
 
-        # ── Song title ────────────────────────────────────────────────────
-        self._title = QLabel('Nenhuma música selecionada')
-        self._title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._title.setStyleSheet(
-            f"color:{C['text_dim']};font-size:12px;font-weight:500;"
-            "letter-spacing:0.3px;"
-        )
-        root.addWidget(self._title)
+        # ── Linha 1: tempo (esq) | nome da música (centro) ──────────────
+        top_row = QHBoxLayout()
+        top_row.setSpacing(0)
+        top_row.setContentsMargins(0, 0, 0, 0)
 
-        # ── Seek bar ──────────────────────────────────────────────────────
-        self._seek = SeekBar()
-        self._seek.seeked.connect(self.sig_seek)
-        root.addWidget(self._seek)
-
-        # ── Main controls row ─────────────────────────────────────────────
-        row = QHBoxLayout()
-        row.setSpacing(0)
-        row.setContentsMargins(0, 0, 0, 0)
-
-        # Time elapsed
         time_col = QVBoxLayout()
         time_col.setSpacing(0)
         self._elapsed = QLabel('00:00')
         self._elapsed.setStyleSheet(
             f"color:{C['text']};font-family:'Courier New',Courier;"
-            f"font-size:20px;font-weight:bold;letter-spacing:2px;"
+            f"font-size:24px;font-weight:bold;letter-spacing:3px;"
         )
         self._total = QLabel('00:00')
+        self._total.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         self._total.setStyleSheet(
             f"color:{C['text_dim']};font-family:'Courier New',Courier;"
             f"font-size:11px;letter-spacing:1px;"
@@ -819,73 +1116,82 @@ class TransportBar(QWidget):
         time_col.addWidget(self._elapsed)
         time_col.addWidget(self._total)
         time_col.addStretch()
-        row.addLayout(time_col)
+        top_row.addLayout(time_col)
 
-        row.addStretch()
+        self._title = QLabel('Nenhuma música selecionada')
+        self._title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._title.setStyleSheet(
+            f"color:{C['text_dim']};font-size:12px;font-weight:500;"
+            "letter-spacing:0.5px;"
+        )
+        top_row.addWidget(self._title, 1)
+        root.addLayout(top_row)
 
-        # Buttons — centered group
+        # ── Linha 2: seek bar largura total ──────────────────────────────
+        self._seek = SeekBar()
+        self._seek.seeked.connect(self.sig_seek)
+        root.addWidget(self._seek)
+
+        # ── Linha 3: botões + volume lado a lado ─────────────────────────
         btn_row = QHBoxLayout()
-        btn_row.setSpacing(14)
-        btn_row.setContentsMargins(0, 0, 0, 0)
+        btn_row.setSpacing(10)
+        btn_row.setContentsMargins(0, 2, 0, 0)
+        btn_row.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
-        self._btn_stop  = TransportButton('⏹', size=48, accent=False)
-        self._btn_play  = TransportButton('▶', size=60, accent=True)
-        self._btn_pause = TransportButton('⏸', size=48, accent=False)
-        for _b in (self._btn_stop, self._btn_play, self._btn_pause):
+        self._btn_prev      = TransportButton('prev', size=40, accent=False)
+        self._btn_stop      = TransportButton('stop', size=44, accent=False)
+        self._btn_playpause = TransportButton('play', size=64, accent=True)
+        self._btn_next      = TransportButton('next', size=40, accent=False)
+
+        for _b in (self._btn_prev, self._btn_stop, self._btn_playpause, self._btn_next):
             _b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
-        self._btn_stop .clicked.connect(self.sig_stop)
-        self._btn_play .clicked.connect(self.sig_play)
-        self._btn_pause.clicked.connect(self.sig_pause)
+        self._btn_prev     .clicked.connect(self.sig_prev)
+        self._btn_stop     .clicked.connect(self._on_stop)
+        self._btn_playpause.clicked.connect(self._toggle)
+        self._btn_next     .clicked.connect(self.sig_next)
 
+        btn_row.addStretch(1)
+        btn_row.addWidget(self._btn_prev)
         btn_row.addWidget(self._btn_stop)
-        btn_row.addWidget(self._btn_play)
-        btn_row.addWidget(self._btn_pause)
-        row.addLayout(btn_row)
+        btn_row.addWidget(self._btn_playpause)
+        btn_row.addWidget(self._btn_next)
+        btn_row.addStretch(1)
 
-        row.addStretch()
-
-        # Volume column (right side)
-        vol_col = QVBoxLayout()
-        vol_col.setSpacing(4)
+        # Volume ao lado direito dos botões
         vlbl = QLabel('VOLUME')
         vlbl.setStyleSheet(
-            f"color:{C['text_dim']};font-size:9px;letter-spacing:2px;")
-        vlbl.setAlignment(Qt.AlignmentFlag.AlignRight)
+            f"color:{C['text_dim']};font-size:9px;letter-spacing:2px;font-weight:bold;")
+        vlbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        vlbl.setContentsMargins(0, 5, 0, 0)
+        self._vol = VolumeSlider()
+        self._vol.set_value(0.8)
+        self._vol.changed.connect(self.sig_volume)
 
-        self._vol = QSlider(Qt.Orientation.Horizontal)
-        self._vol.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._vol.setRange(0, 100)
-        self._vol.setValue(80)
-        self._vol.setFixedWidth(130)
-        self._vol.setStyleSheet(f"""
-            QSlider::groove:horizontal{{
-                height:5px;background:{C['border2']};border-radius:2px;
-            }}
-            QSlider::handle:horizontal{{
-                background:white;width:14px;height:14px;
-                border-radius:7px;margin:-5px 0;
-                border:2px solid {C['accent']};
-            }}
-            QSlider::sub-page:horizontal{{
-                background:qlineargradient(x1:0,y1:0,x2:1,y2:0,
-                    stop:0 {C['accent2']},stop:1 {C['accent_lt']});
-                border-radius:2px;
-            }}
-        """)
-        self._vol.valueChanged.connect(lambda v: self.sig_volume.emit(v / 100))
-        vol_col.addStretch()
+        vol_col = QVBoxLayout()
+        vol_col.setSpacing(4)
+        vol_col.setContentsMargins(0, 0, 0, 0)
+        vol_col.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         vol_col.addWidget(vlbl)
         vol_col.addWidget(self._vol)
-        vol_col.addStretch()
-        row.addLayout(vol_col)
+        btn_row.addLayout(vol_col)
 
-        root.addLayout(row)
+        root.addLayout(btn_row)
+
+    # ── internos ──────────────────────────────────────────────────────────
+    def _toggle(self):
+        if self._state == 'playing':
+            self.sig_pause.emit()
+        else:
+            self.sig_play.emit()
+
+    def _on_stop(self):
+        self.sig_stop.emit()
 
     # ── public ────────────────────────────────────────────────────────────
     def set_song(self, name: str):
         metrics = self._title.fontMetrics()
-        elided  = metrics.elidedText(name, Qt.TextElideMode.ElideMiddle, 340)
+        elided  = metrics.elidedText(name, Qt.TextElideMode.ElideMiddle, 400)
         self._title.setText(elided)
         self._title.setToolTip(name)
 
@@ -900,6 +1206,11 @@ class TransportBar(QWidget):
         self._total.setText(f"{m:02d}:{s:02d}")
 
     def set_state(self, state: str):
+        self._state = state
+        if state == 'playing':
+            self._btn_playpause.set_icon('pause')
+        else:
+            self._btn_playpause.set_icon('play')
         if state == 'stopped':
             self._seek.set_pos(0.0)
             self._elapsed.setText('00:00')
@@ -920,24 +1231,28 @@ class MainWindow(QMainWindow):
         self.setWindowTitle('DJ Mix Player')
         self.resize(1280, 820)
         self.setMinimumSize(900, 600)
+        QTimer.singleShot(300, self._refresh_panel_styles)
 
     # ── UI construction ───────────────────────────────────────────────────
     def _build(self):
         self.setStyleSheet(f"""
-            QMainWindow,QWidget{{
+            QMainWindow{{
                 background:{C['bg']};
+            }}
+            QWidget{{
                 color:{C['text']};
-                font-family:'Segoe UI','Ubuntu',sans-serif;
-                font-size:12px;
+                font-family:'Ubuntu','DejaVu Sans','Arial',sans-serif;
+                font-size:9px;
+                font-weight:bold;
             }}
             QTabWidget::pane{{border:none;background:{C['bg']};}}
             QTabBar::tab{{
                 background:{C['panel']};
                 color:{C['text_dim']};
-                padding:7px 22px;
+                padding:5px 18px;
                 margin-right:2px;
-                border-radius:4px 4px 0 0;
-                font-weight:bold;font-size:13px;letter-spacing:2px;
+                border-radius:3px 3px 0 0;
+                font-weight:bold;font-size:11px;letter-spacing:1px;
             }}
             QTabBar::tab:selected{{
                 background:{C['header']};
@@ -947,6 +1262,49 @@ class MainWindow(QMainWindow):
             QTabBar::tab:hover:!selected{{
                 background:{C['hover']};
                 color:{C['text']};
+            }}
+            QDialog, QMessageBox, QInputDialog{{
+                background:{C['header']};
+                color:{C['text']};
+                font-family:'Ubuntu','DejaVu Sans','Arial',sans-serif;
+                font-size:15px;
+                font-weight:bold;
+            }}
+            QDialog QLabel, QMessageBox QLabel, QInputDialog QLabel{{
+                color:{C['text']};
+                font-size:15px;
+                font-weight:bold;
+            }}
+            QDialog QLineEdit, QInputDialog QLineEdit{{
+                background:{C['panel']};
+                color:{C['text']};
+                border:1px solid {C['border2']};
+                border-radius:4px;
+                padding:6px 10px;
+                font-size:15px;
+                font-weight:bold;
+            }}
+            QDialog QPushButton, QMessageBox QPushButton, QInputDialog QPushButton{{
+                background:{C['accent']};
+                color:white;
+                border:none;
+                border-radius:5px;
+                padding:8px 24px;
+                font-size:14px;
+                font-weight:bold;
+                min-width:80px;
+            }}
+            QDialog QPushButton:hover, QMessageBox QPushButton:hover, QInputDialog QPushButton:hover{{
+                background:{C['accent_lt']};
+            }}
+            QToolTip{{
+                color: #ffffff;
+                background-color: #0d1e3a;
+                border: 1px solid {C['accent']};
+                padding: 4px 8px;
+                border-radius: 4px;
+                font-size: 11px;
+                font-weight: bold;
             }}
         """)
 
@@ -967,7 +1325,7 @@ class MainWindow(QMainWindow):
 
         logo = QLabel('DJ MIX PLAYER')
         logo.setStyleSheet(
-            f"color:{C['accent_lt']};font-size:17px;font-weight:bold;letter-spacing:3px;")
+            f"color:{C['accent_lt']};font-family:'Courier New',Courier,monospace;font-size:14px;font-weight:bold;letter-spacing:3px;")
         tbl.addWidget(logo)
 
         sep = QFrame()
@@ -1072,7 +1430,7 @@ class MainWindow(QMainWindow):
 
         # ── bottom bar ────────────────────────────────────────────────────
         bottom = QWidget()
-        bottom.setFixedHeight(118)
+        bottom.setFixedHeight(150)
         bottom.setStyleSheet(
             f"background:{C['header']};border-top:1px solid {C['border2']};")
         bl = QHBoxLayout(bottom)
@@ -1089,17 +1447,22 @@ class MainWindow(QMainWindow):
         vsep.setStyleSheet(f"color:{C['border2']};margin:10px 0;")
         bl.addWidget(vsep)
 
-        # VU container
+        # VU container — analógico + digital lado a lado
         vu_wrap = QWidget()
-        vu_wrap.setFixedWidth(104)
+        vu_wrap.setFixedWidth(420)
         vul = QHBoxLayout(vu_wrap)
-        vul.setContentsMargins(10, 6, 6, 6)
-        vul.setSpacing(6)
+        vul.setContentsMargins(6, 4, 6, 4)
+        vul.setSpacing(3)
 
-        self._vu_l = VUMeter('L')
-        self._vu_r = VUMeter('R')
+        self._vu_l     = VUMeter('L')
+        self._vu_r     = VUMeter('R')
+        self._vubar_l  = DigitalVUBar()
+        self._vubar_r  = DigitalVUBar()
+
         vul.addWidget(self._vu_l)
         vul.addWidget(self._vu_r)
+        vul.addWidget(self._vubar_l)
+        vul.addWidget(self._vubar_r)
         bl.addWidget(vu_wrap)
 
         root.addWidget(bottom)
@@ -1117,8 +1480,15 @@ class MainWindow(QMainWindow):
         t.sig_play  .connect(e.play)
         t.sig_pause .connect(e.pause)
         t.sig_stop  .connect(self._stop)
+        t.sig_prev  .connect(self._prev)
+        t.sig_next  .connect(self._next)
         t.sig_seek  .connect(e.seek)
         t.sig_volume.connect(e.set_volume)
+
+    def _refresh_panel_styles(self):
+        for pg in self._pages:
+            for panel in pg.get_panels():
+                panel.set_active(False)
 
     # ── tab navigation ────────────────────────────────────────────────────
     def _switch_tab(self, idx: int):
@@ -1172,7 +1542,16 @@ class MainWindow(QMainWindow):
                 break
 
         self._engine.stop()
-        self._engine.load(path)
+        try:
+            self._engine.load(path)
+        except RuntimeError as e:
+            ext = Path(path).suffix.upper()
+            QMessageBox.warning(
+                self, 'Formato não suportado',
+                f'Não foi possível carregar o arquivo:\n{Path(path).name}\n\n'
+                f'Formato {ext} não é suportado pelo backend de áudio.\n\n{e}'
+            )
+            return
         self._engine.play()
         name = display_name(path)
         self._transport.set_song(name)
@@ -1194,20 +1573,32 @@ class MainWindow(QMainWindow):
     def _on_vu(self, l: float, r: float):
         self._vu_l.set_level(l)
         self._vu_r.set_level(r)
+        self._vubar_l.set_level(l)
+        self._vubar_r.set_level(r)
+
+    def _prev(self):
+        if self._cur_panel is not None and self._cur_row > 0:
+            row = self._cur_row - 1
+            self._play(self._cur_panel._songs[row])
+            self._cur_panel._list.setCurrentRow(row)
+            self._cur_panel._list.scrollToItem(self._cur_panel._list.item(row))
+
+    def _next(self):
+        if self._cur_panel is not None and self._cur_row >= 0:
+            row = self._cur_row + 1
+            if row < len(self._cur_panel._songs):
+                self._play(self._cur_panel._songs[row])
+                self._cur_panel._list.setCurrentRow(row)
+                self._cur_panel._list.scrollToItem(self._cur_panel._list.item(row))
 
     def _on_ended(self):
-        # Tenta tocar a próxima música no mesmo painel
         if self._cur_panel is not None and self._cur_row >= 0:
-            next_row = self._cur_row + 1
-            if next_row < len(self._cur_panel._songs):
-                self._play(self._cur_panel._songs[next_row])
-                # Rola a lista para mostrar a música tocando
-                self._cur_panel._list.setCurrentRow(next_row)
-                self._cur_panel._list.scrollToItem(
-                    self._cur_panel._list.item(next_row))
+            row = self._cur_row + 1
+            if row < len(self._cur_panel._songs):
+                self._play(self._cur_panel._songs[row])
+                self._cur_panel._list.setCurrentRow(row)
+                self._cur_panel._list.scrollToItem(self._cur_panel._list.item(row))
                 return
-
-        # Fim da playlist — limpa estado
         self._current   = None
         self._cur_panel = None
         self._cur_row   = -1
