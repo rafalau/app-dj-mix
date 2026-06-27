@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QMimeData, QUrl, QPointF, QRectF
 from PyQt6.QtGui import (QPainter, QColor, QLinearGradient, QRadialGradient, QFont,
-                         QDragEnterEvent, QDropEvent, QPolygonF)
+                         QDragEnterEvent, QDropEvent, QPolygonF, QFontDatabase)
 
 # ── Optional backends ─────────────────────────────────────────────────────────
 try:
@@ -309,12 +309,15 @@ class VUMeter(QWidget):
 
         p.fillRect(0, 0, w, h, QColor(C['bg']))
 
-        margin = 8
+        margin = 4
         cx = w / 2.0
-        cy = float(h - margin)
-        # r + ARC_W deve caber dentro de cx; com ARC_W ≈ r/5 → r ≤ (cx-2)*5/6
-        r     = int(min((cx - 2) * 5.0 / 6.0, cy - 4))
-        ARC_W = max(6, r // 5)
+        # r limitado para que topo da face (cy - r - ARC_W) não saia do widget
+        # ARC_W ≈ r/5 → r + r/5 = 6r/5 ≤ cy → r ≤ 5*cy/6
+        r_tmp  = int(min((cx - 2) * 5.0 / 6.0, h - margin - 4))
+        ARC_W  = max(6, r_tmp // 5)
+        cy     = float(h - ARC_W - margin)
+        r      = int(min((cx - 2) * 5.0 / 6.0, cy * 5.0 / 6.0 - 1))
+        ARC_W  = max(6, r // 5)
         r_mid = r - ARC_W // 2
 
         # Face do medidor
@@ -377,7 +380,7 @@ class VUMeter(QWidget):
                 lift = int((1.0 - abs(sa)) * 9)
                 ly = cyi - int(lbl_r * sa) - 7 - lift
                 p.setPen(QColor('#aaaaaa' if val != 100 else '#ddaa00'))
-                p.setFont(QFont('Ubuntu', max(5, r // 12), QFont.Weight.Bold))
+                p.setFont(QFont('Roboto', max(5, r // 12), QFont.Weight.Bold))
                 p.drawText(lx, ly, 20, 14, Qt.AlignmentFlag.AlignCenter, str(val))
 
         # ── Peak hold ─────────────────────────────────────────────────────
@@ -406,7 +409,7 @@ class VUMeter(QWidget):
 
         # Label
         p.setPen(QColor('#aaaaaa'))
-        p.setFont(QFont('Ubuntu', 8, QFont.Weight.Bold))
+        p.setFont(QFont('Roboto', 10, QFont.Weight.Bold))
         p.drawText(0, cyi - r // 2, w, r // 2,
                    Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
                    self.ch)
@@ -463,6 +466,66 @@ class DigitalVUBar(QWidget):
             pk_c = (C['vu_red'] if self._peak >= 0.85 else
                     C['vu_yellow'] if self._peak >= 0.65 else C['vu_green'])
             p.fillRect(1, pk_y, w - 2, SEG, QColor(pk_c))
+        p.end()
+
+
+# ── Digital VU Bar Horizontal ─────────────────────────────────────────────────
+class HDigitalVUBar(QWidget):
+    def __init__(self, label='L', parent=None):
+        super().__init__(parent)
+        self._lvl  = 0.0
+        self._peak = 0.0
+        self._hold = 0
+        self._label = label
+        self.setFixedHeight(10)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+    def set_level(self, v: float):
+        self._lvl = max(0.0, min(1.0, v))
+        if self._lvl > self._peak:
+            self._peak = self._lvl
+            self._hold = 28
+        else:
+            if self._hold > 0:
+                self._hold -= 1
+            else:
+                self._peak = max(0.0, self._peak - 0.010)
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        w, h = self.width(), self.height()
+        p.fillRect(0, 0, w, h, QColor(C['bg']))
+
+        LBL_W = 14
+        bar_w = w - LBL_W - 4
+        SEG, GAP = 3, 1
+        STEP  = SEG + GAP
+        total = max(1, bar_w // STEP)
+        lit   = int(self._lvl * total)
+
+        p.setPen(QColor('#555555'))
+        p.setFont(QFont('Roboto', 7, QFont.Weight.Bold))
+        p.drawText(0, 0, LBL_W, h, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignHCenter, self._label)
+
+        x0 = LBL_W + 2
+        for i in range(total):
+            pct = i / total
+            color = (C['vu_red'] if pct >= 0.85 else
+                     C['vu_yellow'] if pct >= 0.65 else C['vu_green'])
+            x = x0 + i * STEP
+            if i < lit:
+                p.fillRect(x, 1, SEG, h - 2, QColor(color))
+            else:
+                dim = QColor(color); dim.setAlpha(30)
+                p.fillRect(x, 1, SEG, h - 2, dim)
+
+        if self._peak > 0.02:
+            pk_i = min(int(self._peak * total), total - 1)
+            pk_x = x0 + pk_i * STEP
+            pk_c = (C['vu_red'] if self._peak >= 0.85 else
+                    C['vu_yellow'] if self._peak >= 0.65 else C['vu_green'])
+            p.fillRect(pk_x, 1, SEG, h - 2, QColor(pk_c))
         p.end()
 
 
@@ -548,7 +611,7 @@ class PlaylistPanel(QWidget):
         hl.setSpacing(3)
 
         self._lbl = QLabel(self._name.upper())
-        self._lbl.setStyleSheet("color:white; font-weight:bold; font-size:13px; font-family:'Ubuntu','DejaVu Sans','Arial',sans-serif; letter-spacing:1px;")
+        self._lbl.setStyleSheet("color:white; font-weight:bold; font-size:15px; font-family:'Roboto','DejaVu Sans','Arial',sans-serif; letter-spacing:1px;")
         self._lbl.mouseDoubleClickEvent = lambda _: self._rename()
         self._lbl.setCursor(Qt.CursorShape.IBeamCursor)
         self._lbl.setToolTip('Duplo clique para renomear')
@@ -567,7 +630,7 @@ class PlaylistPanel(QWidget):
             b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             b.setStyleSheet("""
                 QPushButton{background:rgba(255,255,255,.12);color:white;border:none;
-                             border-radius:3px;font-size:11px;}
+                             border-radius:3px;font-size:13px;}
                 QPushButton:hover{background:rgba(255,255,255,.28);}
             """)
             b.clicked.connect(fn)
@@ -580,7 +643,7 @@ class PlaylistPanel(QWidget):
         self._count.setFixedHeight(16)
         self._count.setStyleSheet(
             f"background:{self._darker(self._color)};"
-            f"color:rgba(255,255,255,.5);font-size:9px;padding-left:6px;"
+            f"color:rgba(255,255,255,.5);font-size:11px;padding-left:6px;"
         )
         layout.addWidget(self._count)
 
@@ -588,7 +651,7 @@ class PlaylistPanel(QWidget):
         self._list = PlaylistList()
         self._list.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self._list.setFont(QFont('Ubuntu', 13, QFont.Weight.Bold))
+        self._list.setFont(QFont('Roboto', 15, QFont.Weight.Bold))
         self._list.setItemDelegate(SongDelegate())
         self._apply_list_style(active=False)
         self._list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -624,8 +687,8 @@ class PlaylistPanel(QWidget):
                 border-top:none;
                 border-radius:0 0 3px 3px;
                 color:{text_color};
-                font-family:'Ubuntu','DejaVu Sans','Arial',sans-serif;
-                font-size:13px;
+                font-family:'Roboto','DejaVu Sans','Arial',sans-serif;
+                font-size:15px;
                 font-weight:bold;
                 outline:none;
             }}
@@ -795,38 +858,38 @@ class PlaylistPanel(QWidget):
         return QColor(hex_col).darker(140).name()
 
 
-# ── Tab Page (3×2 grid) ───────────────────────────────────────────────────────
+# ── Tab Page (grid configurável) ──────────────────────────────────────────────
 class TabPage(QWidget):
     sig_play = pyqtSignal(str)
-    COLS, ROWS = 3, 3
 
-    def __init__(self, idx: int, parent=None):
+    def __init__(self, idx: int, cols: int = 3, rows: int = 3, parent=None):
         super().__init__(parent)
         self._panels: list[PlaylistPanel] = []
-        self._idx = idx
+        self._idx  = idx
+        self._cols = cols
+        self._rows = rows
         self._build()
 
     def _build(self):
         g = QGridLayout(self)
         g.setSpacing(7)
         g.setContentsMargins(8, 8, 8, 8)
-        for i in range(self.ROWS * self.COLS):
-            r, c = divmod(i, self.COLS)
+        for i in range(self._rows * self._cols):
+            r, c = divmod(i, self._cols)
             panel = PlaylistPanel(
-                f"PLAYLIST {i + 1 + self._idx * self.ROWS * self.COLS}",
+                f"PLAYLIST {i + 1 + self._idx * self._rows * self._cols}",
                 PANEL_HEADERS[i % len(PANEL_HEADERS)]
             )
             panel.sig_play.connect(self.sig_play)
             self._panels.append(panel)
             g.addWidget(panel, r, c)
-        for c in range(self.COLS):  g.setColumnStretch(c, 1)
-        for r in range(self.ROWS):  g.setRowStretch(r, 1)
+        for c in range(self._cols):  g.setColumnStretch(c, 1)
+        for r in range(self._rows):  g.setRowStretch(r, 1)
 
-        # Tab navega entre as listas das playlists em ordem
         lists = [p._list for p in self._panels]
         for i in range(len(lists) - 1):
             QWidget.setTabOrder(lists[i], lists[i + 1])
-        QWidget.setTabOrder(lists[-1], lists[0])  # circular
+        QWidget.setTabOrder(lists[-1], lists[0])
 
     def get_panels(self) -> list: return self._panels
 
@@ -1091,37 +1154,19 @@ class TransportBar(QWidget):
 
     def _build(self):
         root = QVBoxLayout(self)
-        root.setContentsMargins(16, 4, 16, 4)
-        root.setSpacing(3)
+        root.setContentsMargins(16, 2, 16, 2)
+        root.setSpacing(1)
 
         # ── Linha 1: tempo (esq) | nome da música (centro) ──────────────
         top_row = QHBoxLayout()
         top_row.setSpacing(0)
         top_row.setContentsMargins(0, 0, 0, 0)
 
-        time_col = QVBoxLayout()
-        time_col.setSpacing(0)
-        self._elapsed = QLabel('00:00')
-        self._elapsed.setStyleSheet(
-            f"color:{C['text']};font-family:'Courier New',Courier;"
-            f"font-size:24px;font-weight:bold;letter-spacing:3px;"
-        )
-        self._total = QLabel('00:00')
-        self._total.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-        self._total.setStyleSheet(
-            f"color:{C['text_dim']};font-family:'Courier New',Courier;"
-            f"font-size:11px;letter-spacing:1px;"
-        )
-        time_col.addStretch()
-        time_col.addWidget(self._elapsed)
-        time_col.addWidget(self._total)
-        time_col.addStretch()
-        top_row.addLayout(time_col)
-
         self._title = QLabel('Nenhuma música selecionada')
         self._title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._title.setFixedHeight(22)
         self._title.setStyleSheet(
-            f"color:{C['text_dim']};font-size:12px;font-weight:500;"
+            f"color:{C['text_dim']};font-size:13px;font-weight:500;"
             "letter-spacing:0.5px;"
         )
         top_row.addWidget(self._title, 1)
@@ -1132,16 +1177,35 @@ class TransportBar(QWidget):
         self._seek.seeked.connect(self.sig_seek)
         root.addWidget(self._seek)
 
-        # ── Linha 3: botões + volume lado a lado ─────────────────────────
+        # ── Linha 3: tempo | botões | volume ─────────────────────────────
         btn_row = QHBoxLayout()
         btn_row.setSpacing(10)
-        btn_row.setContentsMargins(0, 2, 0, 0)
+        btn_row.setContentsMargins(12, 2, 0, 0)
         btn_row.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
-        self._btn_prev      = TransportButton('prev', size=40, accent=False)
-        self._btn_stop      = TransportButton('stop', size=44, accent=False)
-        self._btn_playpause = TransportButton('play', size=64, accent=True)
-        self._btn_next      = TransportButton('next', size=40, accent=False)
+        # Tempo à esquerda dos botões
+        self._elapsed = QLabel('00:00')
+        self._elapsed.setStyleSheet(
+            f"color:{C['text']};font-family:'Courier New',Courier;"
+            f"font-size:20px;font-weight:bold;letter-spacing:3px;"
+        )
+        self._total = QLabel('00:00')
+        self._total.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self._total.setStyleSheet(
+            f"color:{C['text_dim']};font-family:'Courier New',Courier;"
+            f"font-size:13px;letter-spacing:1px;"
+        )
+        time_col = QVBoxLayout()
+        time_col.setSpacing(0)
+        time_col.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        time_col.addWidget(self._elapsed)
+        time_col.addWidget(self._total)
+        btn_row.addLayout(time_col)
+
+        self._btn_prev      = TransportButton('prev', size=32, accent=False)
+        self._btn_stop      = TransportButton('stop', size=36, accent=False)
+        self._btn_playpause = TransportButton('play', size=52, accent=True)
+        self._btn_next      = TransportButton('next', size=32, accent=False)
 
         for _b in (self._btn_prev, self._btn_stop, self._btn_playpause, self._btn_next):
             _b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -1161,7 +1225,7 @@ class TransportBar(QWidget):
         # Volume ao lado direito dos botões
         vlbl = QLabel('VOLUME')
         vlbl.setStyleSheet(
-            f"color:{C['text_dim']};font-size:9px;letter-spacing:2px;font-weight:bold;")
+            f"color:{C['text_dim']};font-size:11px;letter-spacing:2px;font-weight:bold;")
         vlbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         vlbl.setContentsMargins(0, 5, 0, 0)
         self._vol = VolumeSlider()
@@ -1241,8 +1305,8 @@ class MainWindow(QMainWindow):
             }}
             QWidget{{
                 color:{C['text']};
-                font-family:'Ubuntu','DejaVu Sans','Arial',sans-serif;
-                font-size:9px;
+                font-family:'Roboto','DejaVu Sans','Arial',sans-serif;
+                font-size:11px;
                 font-weight:bold;
             }}
             QTabWidget::pane{{border:none;background:{C['bg']};}}
@@ -1252,7 +1316,7 @@ class MainWindow(QMainWindow):
                 padding:5px 18px;
                 margin-right:2px;
                 border-radius:3px 3px 0 0;
-                font-weight:bold;font-size:11px;letter-spacing:1px;
+                font-weight:bold;font-size:13px;letter-spacing:1px;
             }}
             QTabBar::tab:selected{{
                 background:{C['header']};
@@ -1266,13 +1330,13 @@ class MainWindow(QMainWindow):
             QDialog, QMessageBox, QInputDialog{{
                 background:{C['header']};
                 color:{C['text']};
-                font-family:'Ubuntu','DejaVu Sans','Arial',sans-serif;
-                font-size:15px;
+                font-family:'Roboto','DejaVu Sans','Arial',sans-serif;
+                font-size:17px;
                 font-weight:bold;
             }}
             QDialog QLabel, QMessageBox QLabel, QInputDialog QLabel{{
                 color:{C['text']};
-                font-size:15px;
+                font-size:17px;
                 font-weight:bold;
             }}
             QDialog QLineEdit, QInputDialog QLineEdit{{
@@ -1281,7 +1345,7 @@ class MainWindow(QMainWindow):
                 border:1px solid {C['border2']};
                 border-radius:4px;
                 padding:6px 10px;
-                font-size:15px;
+                font-size:17px;
                 font-weight:bold;
             }}
             QDialog QPushButton, QMessageBox QPushButton, QInputDialog QPushButton{{
@@ -1290,7 +1354,7 @@ class MainWindow(QMainWindow):
                 border:none;
                 border-radius:5px;
                 padding:8px 24px;
-                font-size:14px;
+                font-size:16px;
                 font-weight:bold;
                 min-width:80px;
             }}
@@ -1303,7 +1367,7 @@ class MainWindow(QMainWindow):
                 border: 1px solid {C['accent']};
                 padding: 4px 8px;
                 border-radius: 4px;
-                font-size: 11px;
+                font-size: 13px;
                 font-weight: bold;
             }}
         """)
@@ -1325,7 +1389,7 @@ class MainWindow(QMainWindow):
 
         logo = QLabel('DJ MIX PLAYER')
         logo.setStyleSheet(
-            f"color:{C['accent_lt']};font-family:'Courier New',Courier,monospace;font-size:14px;font-weight:bold;letter-spacing:3px;")
+            f"color:{C['accent_lt']};font-family:'Courier New',Courier,monospace;font-size:16px;font-weight:bold;letter-spacing:3px;")
         tbl.addWidget(logo)
 
         sep = QFrame()
@@ -1335,14 +1399,14 @@ class MainWindow(QMainWindow):
 
         self._now_playing = QLabel('—')
         self._now_playing.setStyleSheet(
-            f"color:{C['text_dim']};font-size:11px;max-width:320px;")
+            f"color:{C['text_dim']};font-size:13px;max-width:320px;")
         tbl.addWidget(self._now_playing)
         tbl.addStretch()
 
         # Search
         self._search = QLineEdit()
         self._search.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
-        self._search.setPlaceholderText('  🔍  Buscar música...')
+        self._search.setPlaceholderText('  🔍  Filtrar...')
         self._search.setFixedWidth(260)
         self._search.setStyleSheet(f"""
             QLineEdit{{
@@ -1351,17 +1415,42 @@ class MainWindow(QMainWindow):
                 border-radius:16px;
                 color:{C['text']};
                 padding:6px 14px;
-                font-size:12px;
+                font-size:14px;
             }}
             QLineEdit:focus{{border:1px solid {C['accent_lt']};}}
         """)
         self._search.textChanged.connect(self._on_search)
-        tbl.addWidget(self._search)
+
+        self._btn_clear_filter = QPushButton('LIMPAR')
+        self._btn_clear_filter.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._btn_clear_filter.setStyleSheet(f"""
+            QPushButton{{
+                background:{C['accent']};
+                color:white;
+                border:none;
+                border-radius:8px;
+                padding:0px 12px;
+                font-size:11px;
+                font-weight:bold;
+            }}
+            QPushButton:hover{{
+                background:{C['accent_lt']};
+            }}
+        """)
+        self._btn_clear_filter.setFixedHeight(32)
+        self._btn_clear_filter.clicked.connect(lambda: self._search.clear())
+
+        filter_row = QHBoxLayout()
+        filter_row.setSpacing(2)
+        filter_row.setContentsMargins(0, 0, 20, 0)
+        filter_row.addWidget(self._search)
+        filter_row.addWidget(self._btn_clear_filter)
+        tbl.addLayout(filter_row)
 
         # Output device
         out_lbl = QLabel('SAÍDA')
         out_lbl.setStyleSheet(
-            f"color:{C['text_dim']};font-size:9px;letter-spacing:1px;")
+            f"color:{C['text_dim']};font-size:11px;letter-spacing:1px;")
         tbl.addWidget(out_lbl)
 
         self._dev_combo = QComboBox()
@@ -1404,7 +1493,7 @@ class MainWindow(QMainWindow):
         sl.setSpacing(6)
 
         self._tab_btns: list[QPushButton] = []
-        for i in range(5):
+        for i in range(8):
             b = QPushButton(str(i + 1))
             b.setFixedSize(36, 36)
             b.setCheckable(True)
@@ -1412,15 +1501,42 @@ class MainWindow(QMainWindow):
             b.clicked.connect(lambda _, idx=i: self._switch_tab(idx))
             self._tab_btns.append(b)
             sl.addWidget(b)
+
         sl.addStretch()
+
+        # Botões de seleção de layout
+        lyt_lbl = QLabel('LAYOUT')
+        lyt_lbl.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        lyt_lbl.setStyleSheet(f"color:{C['text_dim']};font-size:8px;font-weight:bold;letter-spacing:1px;")
+        sl.addWidget(lyt_lbl)
+
+        self._layout_btns: list[QPushButton] = []
+        for label, cols, rows in [('3×3', 3, 3), ('4×3', 4, 3)]:
+            b = QPushButton(label)
+            b.setFixedSize(36, 24)
+            b.setCheckable(True)
+            b.setChecked(cols == 3)
+            b.clicked.connect(lambda _, c=cols, r=rows: self._set_grid_layout(c, r))
+            b.setStyleSheet(f"""
+                QPushButton{{background:{C['panel']};color:{C['text_dim']};
+                    border:1px solid {C['border2']};border-radius:4px;
+                    font-size:10px;font-weight:bold;}}
+                QPushButton:checked{{background:{C['accent']};color:white;border:none;}}
+                QPushButton:hover:!checked{{background:{C['hover']};color:{C['text']};}}
+            """)
+            self._layout_btns.append(b)
+            sl.addWidget(b)
+
         self._update_tab_btns(0)
         cl.addWidget(sidebar)
 
         # Stacked pages
         from PyQt6.QtWidgets import QStackedWidget
+        self._grid_cols = 3
+        self._grid_rows = 3
         self._stack = QStackedWidget()
-        for i in range(5):
-            page = TabPage(i)
+        for i in range(8):
+            page = TabPage(i, self._grid_cols, self._grid_rows)
             page.sig_play.connect(self._play)
             self._pages.append(page)
             self._stack.addWidget(page)
@@ -1430,9 +1546,9 @@ class MainWindow(QMainWindow):
 
         # ── bottom bar ────────────────────────────────────────────────────
         bottom = QWidget()
-        bottom.setFixedHeight(150)
+        bottom.setFixedHeight(136)
         bottom.setStyleSheet(
-            f"background:{C['header']};border-top:1px solid {C['border2']};")
+            f"background:{C['header']};")
         bl = QHBoxLayout(bottom)
         bl.setContentsMargins(0, 0, 10, 0)
         bl.setSpacing(0)
@@ -1447,22 +1563,27 @@ class MainWindow(QMainWindow):
         vsep.setStyleSheet(f"color:{C['border2']};margin:10px 0;")
         bl.addWidget(vsep)
 
-        # VU container — analógico + digital lado a lado
+        # VU container — barras horizontais no topo + analógicos embaixo
         vu_wrap = QWidget()
         vu_wrap.setFixedWidth(420)
-        vul = QHBoxLayout(vu_wrap)
-        vul.setContentsMargins(6, 4, 6, 4)
-        vul.setSpacing(3)
+        vu_root = QVBoxLayout(vu_wrap)
+        vu_root.setContentsMargins(6, 0, 6, 4)
+        vu_root.setSpacing(2)
 
-        self._vu_l     = VUMeter('L')
-        self._vu_r     = VUMeter('R')
-        self._vubar_l  = DigitalVUBar()
-        self._vubar_r  = DigitalVUBar()
+        self._hvu_l = HDigitalVUBar('L')
+        self._hvu_r = HDigitalVUBar('R')
+        vu_root.addWidget(self._hvu_l)
+        vu_root.addWidget(self._hvu_r)
 
-        vul.addWidget(self._vu_l)
-        vul.addWidget(self._vu_r)
-        vul.addWidget(self._vubar_l)
-        vul.addWidget(self._vubar_r)
+        self._vu_l = VUMeter('L')
+        self._vu_r = VUMeter('R')
+        analog_row = QHBoxLayout()
+        analog_row.setSpacing(3)
+        analog_row.setContentsMargins(0, 10, 0, 0)
+        analog_row.addWidget(self._vu_l)
+        analog_row.addWidget(self._vu_r)
+        vu_root.addLayout(analog_row)
+
         bl.addWidget(vu_wrap)
 
         root.addWidget(bottom)
@@ -1504,7 +1625,7 @@ class MainWindow(QMainWindow):
                         color:white;
                         border:none;
                         border-radius:8px;
-                        font-size:15px;
+                        font-size:17px;
                         font-weight:bold;
                     }}
                 """)
@@ -1515,7 +1636,7 @@ class MainWindow(QMainWindow):
                         color:{C['text_dim']};
                         border:1px solid {C['border2']};
                         border-radius:8px;
-                        font-size:15px;
+                        font-size:17px;
                         font-weight:bold;
                     }}
                     QPushButton:hover{{
@@ -1524,6 +1645,38 @@ class MainWindow(QMainWindow):
                         border:1px solid {C['accent']};
                     }}
                 """)
+
+    def _set_grid_layout(self, cols: int, rows: int):
+        if cols == self._grid_cols and rows == self._grid_rows:
+            return
+        # salva dados atuais
+        saved = [p.to_dict() for p in self._pages]
+        cur_idx = self._stack.currentIndex()
+
+        # remove páginas antigas
+        for page in self._pages:
+            self._stack.removeWidget(page)
+            page.deleteLater()
+        self._pages.clear()
+
+        self._grid_cols = cols
+        self._grid_rows = rows
+
+        # recria páginas com novo layout
+        for i in range(8):
+            page = TabPage(i, cols, rows)
+            page.sig_play.connect(self._play)
+            self._pages.append(page)
+            self._stack.addWidget(page)
+            if i < len(saved):
+                page.from_dict(saved[i])
+
+        self._stack.setCurrentIndex(cur_idx)
+        self._update_tab_btns(cur_idx)
+
+        # atualiza aparência dos botões de layout
+        for b in self._layout_btns:
+            b.setChecked(b.text() == f'{cols}×{rows}')
 
     # ── slots ─────────────────────────────────────────────────────────────
     def _play(self, path: str):
@@ -1573,8 +1726,8 @@ class MainWindow(QMainWindow):
     def _on_vu(self, l: float, r: float):
         self._vu_l.set_level(l)
         self._vu_r.set_level(r)
-        self._vubar_l.set_level(l)
-        self._vubar_r.set_level(r)
+        self._hvu_l.set_level(l)
+        self._hvu_r.set_level(r)
 
     def _prev(self):
         if self._cur_panel is not None and self._cur_row > 0:
@@ -1645,6 +1798,10 @@ def main():
 
     app = QApplication(sys.argv)
     app.setApplicationName('DJ Mix Player')
+
+    _fonts_dir = Path(__file__).parent / 'fonts' / 'static'
+    for _ttf in _fonts_dir.glob('*.ttf'):
+        QFontDatabase.addApplicationFont(str(_ttf))
 
     win = MainWindow()
     win.show()
