@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 DJ Mix Player
-pip install PyQt6 pygame mutagen sounddevice
+pip install PyQt6 pygame mutagen sounddevice soundfile
 """
 import sys
 import os
@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QPushButton, QListWidget, QListWidgetItem,
     QLineEdit, QComboBox, QFileDialog, QMessageBox, QMenu,
-    QTabWidget, QSizePolicy, QFrame, QScrollArea,
+    QTabWidget, QSizePolicy, QFrame, QScrollArea, QDialog,
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QMimeData, QUrl, QPointF, QRectF
 from PyQt6.QtGui import (QPainter, QColor, QLinearGradient, QRadialGradient, QFont,
@@ -43,9 +43,17 @@ try:
 except Exception:
     HAS_MUTAGEN = False
 
+try:
+    import soundfile as sf
+    HAS_SF = True
+except ImportError:
+    HAS_SF = False
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 AUDIO_EXTENSIONS = {'.mp3', '.mpa', '.wav', '.flac', '.ogg', '.aac', '.m4a', '.wma', '.opus', '.mp2', '.mp4'}
 FORMATS_FILTER = "Áudio (*.mp3 *.mpa *.wav *.flac *.ogg *.aac *.m4a *.wma *.opus *.mp2 *.mp4);;Todos (*.*)"
+
+CUE_POINTS: dict[str, list[float]] = {}  # path → sorted list of fracs 0.0-1.0
 
 C = {
     'bg':        '#111111',
@@ -269,6 +277,636 @@ class AudioEngine(QObject):
     def state(self): return self._state
     @property
     def duration(self): return self._duration
+
+
+# ── CUE Engine ────────────────────────────────────────────────────────────────
+class CueEngine(QObject):
+    sig_pos   = pyqtSignal(float)   # 0.0–1.0
+    sig_state = pyqtSignal(str)     # playing / paused / stopped
+    sig_ended = pyqtSignal()
+    sig_dur   = pyqtSignal(int)     # seconds
+
+    def __init__(self):
+        super().__init__()
+        self._path      = None
+        self._data      = None   # numpy array loaded by soundfile
+        self._samplerate = 44100
+        self._channels  = 2
+        self._state     = 'stopped'
+        self._duration  = 0
+        self._volume    = 0.8
+        self._cursor    = 0      # sample cursor (frame index)
+        self._lock      = threading.Lock()
+        self._stream    = None
+        self._device    = None   # None = default
+
+        self._pos_timer = QTimer()
+        self._pos_timer.setInterval(50)
+        self._pos_timer.timeout.connect(self._emit_pos)
+        self._pos_timer.start()
+
+    # ── public API ─────────────────────────────────────────────────────────
+    def get_devices(self) -> list:
+        if HAS_SD:
+            try:
+                return [d['name'] for d in sd.query_devices()
+                        if d['max_output_channels'] > 0]
+            except Exception:
+                pass
+        return ['Dispositivo padrão']
+
+    def set_device(self, name: str):
+        self._device = name if name and name != 'Dispositivo padrão' else None
+
+    def load(self, path: str) -> bool:
+        if not HAS_SF:
+            return False
+        self.stop()
+        try:
+            data, sr = sf.read(path, dtype='float32', always_2d=True)
+            self._data       = data
+            self._samplerate = sr
+            self._channels   = data.shape[1] if data.ndim > 1 else 1
+            self._path       = path
+            self._duration   = int(len(data) / sr)
+            with self._lock:
+                self._cursor = 0
+            self.sig_dur.emit(self._duration)
+            self.sig_state.emit('stopped')
+            return True
+        except Exception as e:
+            print(f"CueEngine.load error: {e}")
+            return False
+
+    def play(self):
+        if not HAS_SF:
+            QMessageBox.warning(
+                None, 'CUE indisponível',
+                'soundfile não está instalado.\nExecute: pip install soundfile'
+            )
+            return
+        if self._data is None:
+            return
+        if self._state == 'playing':
+            return
+        if self._state == 'paused':
+            # resume — stream is still open; just change state flag
+            self._state = 'playing'
+            self.sig_state.emit('playing')
+            return
+        # stopped → start stream from cursor
+        self._start_stream()
+        self._state = 'playing'
+        self.sig_state.emit('playing')
+
+    def pause(self):
+        if self._state == 'playing':
+            self._state = 'paused'
+            self.sig_state.emit('paused')
+
+    def stop(self):
+        self._state = 'stopped'
+        self._close_stream()
+        with self._lock:
+            self._cursor = 0
+        self.sig_state.emit('stopped')
+        self.sig_pos.emit(0.0)
+
+    def seek(self, frac: float):
+        if self._data is None:
+            return
+        total = len(self._data)
+        new_cursor = int(max(0.0, min(1.0, frac)) * total)
+        was_playing = self._state == 'playing'
+        if was_playing:
+            self._close_stream()
+        with self._lock:
+            self._cursor = new_cursor
+        if was_playing:
+            self._start_stream()
+            self._state = 'playing'
+            self.sig_state.emit('playing')
+
+    def set_volume(self, v: float):
+        self._volume = max(0.0, min(1.0, v))
+
+    # ── internal ───────────────────────────────────────────────────────────
+    def _start_stream(self):
+        self._close_stream()
+        if not HAS_SD or self._data is None:
+            return
+        try:
+            kwargs = dict(
+                samplerate=self._samplerate,
+                channels=self._channels,
+                dtype='float32',
+                callback=self._callback,
+                finished_callback=self._on_finished,
+            )
+            if self._device is not None:
+                kwargs['device'] = self._device
+            self._stream = sd.OutputStream(**kwargs)
+            self._stream.start()
+        except Exception as e:
+            print(f"CueEngine stream error: {e}")
+            self._stream = None
+
+    def _close_stream(self):
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+
+    def _callback(self, outdata, frames, time_info, status):
+        if self._state != 'playing' or self._data is None:
+            outdata[:] = 0
+            return
+        with self._lock:
+            start = self._cursor
+            end   = start + frames
+            chunk = self._data[start:end]
+            self._cursor = min(end, len(self._data))
+
+        n = len(chunk)
+        if n < frames:
+            outdata[:n]  = chunk * self._volume
+            outdata[n:]  = 0
+        else:
+            outdata[:] = chunk * self._volume
+
+    def _on_finished(self):
+        # Called from sounddevice thread when stream finishes
+        if self._state == 'playing':
+            self._state = 'stopped'
+            with self._lock:
+                self._cursor = 0
+            self.sig_state.emit('stopped')
+            self.sig_ended.emit()
+
+    def _emit_pos(self):
+        if self._data is None or len(self._data) == 0:
+            return
+        with self._lock:
+            cursor = self._cursor
+        frac = cursor / len(self._data)
+        self.sig_pos.emit(frac)
+
+    @property
+    def state(self): return self._state
+    @property
+    def duration(self): return self._duration
+
+
+# ── Waveform Widget ───────────────────────────────────────────────────────────
+class WaveformWidget(QWidget):
+    seeked = pyqtSignal(float)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._peaks = None   # np.ndarray | list[float] | None
+        self._pos   = 0.0
+        self._cues: list[float] = []
+        self._drag  = False
+        self.setMinimumHeight(90)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def set_data(self, peaks):
+        self._peaks = peaks
+        self.update()
+
+    def set_pos(self, frac: float):
+        self._pos = max(0.0, min(1.0, frac))
+        self.update()
+
+    def set_cues(self, fracs: list):
+        self._cues = list(fracs)
+        self.update()
+
+    def paintEvent(self, _):
+        from PyQt6.QtGui import QPen
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+
+        # Background
+        p.fillRect(0, 0, w, h, QColor(C['bg']))
+
+        if self._peaks is None or len(self._peaks) == 0:
+            p.setPen(QColor(C['text_dim']))
+            p.setFont(QFont('Roboto', 10))
+            p.drawText(0, 0, w, h,
+                       Qt.AlignmentFlag.AlignCenter,
+                       'Carregando waveform...')
+            p.end()
+            return
+
+        peaks = self._peaks
+        n     = len(peaks)
+        cy    = h / 2.0
+        playhead_x = int(self._pos * w)
+
+        accent = QColor(C['accent'])
+
+        # Draw waveform bars pixel by pixel
+        for x in range(w):
+            idx = int(x / w * n)
+            idx = max(0, min(n - 1, idx))
+            peak_val = float(peaks[idx])
+            bar_h = max(1, int(peak_val * (h - 4)))
+
+            col = QColor(accent)
+            if x < playhead_x:
+                col.setAlpha(200)
+            else:
+                col.setAlpha(60)
+
+            p.fillRect(x, int(cy - bar_h / 2), 1, bar_h, col)
+
+        # Draw CUE markers
+        for i, frac in enumerate(self._cues):
+            cx_cue = int(frac * w)
+            cue_col = QColor('#ffcc00')
+            p.setPen(QPen(cue_col, 2))
+            p.drawLine(cx_cue, 0, cx_cue, h)
+
+            # Small downward triangle at top
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(cue_col)
+            tri = QPolygonF([
+                QPointF(cx_cue - 5, 0),
+                QPointF(cx_cue + 5, 0),
+                QPointF(cx_cue,     8),
+            ])
+            p.drawPolygon(tri)
+
+            # CUE index number inside triangle area
+            p.setPen(QColor('#111111'))
+            p.setFont(QFont('Roboto', 6, QFont.Weight.Bold))
+            p.drawText(cx_cue - 5, 0, 10, 9,
+                       Qt.AlignmentFlag.AlignCenter,
+                       str(i + 1))
+
+        # Draw playhead
+        p.setPen(QPen(QColor('white'), 2))
+        p.drawLine(playhead_x, 0, playhead_x, h)
+
+        p.end()
+
+    def _frac(self, e) -> float:
+        return max(0.0, min(1.0, e.position().x() / self.width()))
+
+    def mousePressEvent(self, e):
+        self._drag = True
+        frac = self._frac(e)
+        self._pos = frac
+        self.update()
+        self.seeked.emit(frac)
+
+    def mouseMoveEvent(self, e):
+        if self._drag:
+            frac = self._frac(e)
+            self._pos = frac
+            self.update()
+            self.seeked.emit(frac)
+
+    def mouseReleaseEvent(self, e):
+        self._drag = False
+
+
+# ── CUE Window ────────────────────────────────────────────────────────────────
+class CueWindow(QDialog):
+    sig_waveform_ready = pyqtSignal(object)
+    sig_cue_changed    = pyqtSignal(str)
+
+    def __init__(self, cue_engine: 'CueEngine', parent=None):
+        super().__init__(parent)
+        self._engine     = cue_engine
+        self._path       = None
+        self._cue_points: dict[str, list[float]] = {}  # path → [frac, ...]
+        self._cur_pos    = 0.0
+        self.setWindowTitle('CUE — Pré-escuta')
+        self.setMinimumWidth(460)
+        self.setModal(False)
+        self._build()
+        self._connect()
+
+    def _build(self):
+        self.setStyleSheet(f"""
+            QDialog{{
+                background:{C['bg']};
+                color:{C['text']};
+                font-family:'Roboto','DejaVu Sans','Arial',sans-serif;
+            }}
+            QLabel{{
+                color:{C['text']};
+                font-size:12px;
+                font-weight:bold;
+            }}
+            QPushButton{{
+                background:{C['panel2']};
+                color:{C['text']};
+                border:1px solid {C['border2']};
+                border-radius:5px;
+                padding:6px 18px;
+                font-size:12px;
+                font-weight:bold;
+            }}
+            QPushButton:hover{{
+                background:{C['hover']};
+                border:1px solid {C['accent']};
+            }}
+            QComboBox{{
+                background:{C['panel']};
+                border:1px solid {C['border2']};
+                border-radius:5px;
+                color:{C['text']};
+                padding:4px 10px;
+                font-size:11px;
+            }}
+            QComboBox::drop-down{{border:none;width:18px;}}
+            QComboBox QAbstractItemView{{
+                background:{C['panel2']};
+                border:1px solid {C['border2']};
+                color:{C['text']};
+                selection-background-color:{C['sel']};
+                outline:none;
+            }}
+        """)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(18, 14, 18, 14)
+        root.setSpacing(10)
+
+        # Header label
+        hdr_lbl = QLabel('🎧  CUE — PRÉ-ESCUTA')
+        hdr_lbl.setStyleSheet(
+            f"color:{C['accent_lt']};font-size:14px;font-weight:bold;letter-spacing:2px;")
+        root.addWidget(hdr_lbl)
+
+        # Track name
+        self._track_lbl = QLabel('—')
+        self._track_lbl.setStyleSheet(
+            f"color:{C['text']};font-size:13px;font-weight:bold;")
+        self._track_lbl.setWordWrap(True)
+        root.addWidget(self._track_lbl)
+
+        # Waveform (replaces SeekBar in CUE window)
+        self._waveform = WaveformWidget()
+        root.addWidget(self._waveform)
+
+        # Time label
+        self._time_lbl = QLabel('00:00')
+        self._time_lbl.setStyleSheet(
+            f"color:{C['text_dim']};font-size:11px;font-family:'Courier New',monospace;")
+        root.addWidget(self._time_lbl)
+
+        # Play/Pause + Stop + MARCAR CUE
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+        self._btn_play = QPushButton('▶  PLAY')
+        self._btn_play.setStyleSheet(
+            f"QPushButton{{background:{C['accent']};color:white;border:none;"
+            f"border-radius:5px;padding:7px 22px;font-weight:bold;font-size:13px;}}"
+            f"QPushButton:hover{{background:{C['accent_lt']};}}"
+        )
+        self._btn_stop = QPushButton('■  STOP')
+
+        self._btn_mark = QPushButton('⊕  MARCAR CUE')
+        self._btn_mark.setStyleSheet(
+            f"QPushButton{{background:#1a4a1a;color:#44ff44;border:1px solid #2a7a2a;"
+            f"border-radius:5px;padding:7px 14px;font-weight:bold;font-size:12px;}}"
+            f"QPushButton:hover{{background:#2a6a2a;}}"
+        )
+        btn_row.addWidget(self._btn_play)
+        btn_row.addWidget(self._btn_stop)
+        btn_row.addStretch()
+        btn_row.addWidget(self._btn_mark)
+        root.addLayout(btn_row)
+
+        # ── Lista de CUE points ───────────────────────────────────────────
+        cue_hdr = QHBoxLayout()
+        cue_hdr.setContentsMargins(0, 4, 0, 0)
+        cue_pts_lbl = QLabel('PONTOS CUE')
+        cue_pts_lbl.setStyleSheet(
+            f"color:{C['text_dim']};font-size:10px;font-weight:bold;letter-spacing:1px;")
+        self._btn_clear_pts = QPushButton('LIMPAR PONTOS')
+        self._btn_clear_pts.setStyleSheet(
+            f"QPushButton{{background:transparent;color:{C['text_dim']};"
+            f"border:none;font-size:10px;font-weight:bold;padding:2px 6px;}}"
+            f"QPushButton:hover{{color:{C['text']};}}"
+        )
+        cue_hdr.addWidget(cue_pts_lbl)
+        cue_hdr.addStretch()
+        cue_hdr.addWidget(self._btn_clear_pts)
+        root.addLayout(cue_hdr)
+
+        self._pts_list = QListWidget()
+        self._pts_list.setFixedHeight(100)
+        self._pts_list.setStyleSheet(f"""
+            QListWidget{{
+                background:{C['panel']};
+                border:1px solid {C['border2']};
+                border-radius:4px;
+                color:{C['text']};
+                font-size:12px;
+                font-family:'Courier New',monospace;
+            }}
+            QListWidget::item{{padding:3px 8px;}}
+            QListWidget::item:selected{{background:{C['accent']};color:white;}}
+            QListWidget::item:hover{{background:{C['hover']};}}
+        """)
+        root.addWidget(self._pts_list)
+
+        # Volume
+        vol_row = QHBoxLayout()
+        vol_row.setSpacing(8)
+        vol_lbl = QLabel('VOL')
+        vol_lbl.setStyleSheet(f"color:{C['text_dim']};font-size:11px;letter-spacing:1px;")
+        self._vol = VolumeSlider()
+        self._vol.set_value(0.8)
+        vol_row.addWidget(vol_lbl)
+        vol_row.addWidget(self._vol)
+        vol_row.addStretch()
+        root.addLayout(vol_row)
+
+        # Device selector
+        dev_row = QHBoxLayout()
+        dev_row.setSpacing(8)
+        dev_lbl = QLabel('SAÍDA CUE')
+        dev_lbl.setStyleSheet(f"color:{C['text_dim']};font-size:11px;letter-spacing:1px;")
+        self._dev_combo = QComboBox()
+        self._dev_combo.setFixedWidth(220)
+        self._dev_combo.addItems(self._engine.get_devices())
+        dev_row.addWidget(dev_lbl)
+        dev_row.addWidget(self._dev_combo)
+        dev_row.addStretch()
+        root.addLayout(dev_row)
+
+        # Clear button
+        self._btn_clear = QPushButton('FECHAR CUE')
+        self._btn_clear.setStyleSheet(
+            f"QPushButton{{background:{C['panel2']};color:{C['text_dim']};"
+            f"border:1px solid {C['border2']};border-radius:5px;"
+            f"padding:5px 14px;font-size:11px;font-weight:bold;}}"
+            f"QPushButton:hover{{background:{C['hover']};color:{C['text']};"
+            f"border:1px solid {C['accent']};}}"
+        )
+        root.addWidget(self._btn_clear)
+
+    def _connect(self):
+        e = self._engine
+        e.sig_pos  .connect(self._on_pos)
+        e.sig_state.connect(self._on_state)
+        e.sig_dur  .connect(self._on_dur)
+
+        self._waveform.seeked.connect(e.seek)
+        self._vol.changed.connect(e.set_volume)
+        self._dev_combo.currentTextChanged.connect(e.set_device)
+
+        self._btn_play.clicked.connect(self._toggle)
+        self._btn_stop.clicked.connect(e.stop)
+        self._btn_clear.clicked.connect(self._on_clear)
+        self._btn_mark.clicked.connect(self._mark_cue)
+        self._btn_clear_pts.clicked.connect(self._clear_cue_points)
+        self._pts_list.itemDoubleClicked.connect(self._jump_to_cue)
+
+        self.sig_waveform_ready.connect(self._waveform.set_data)
+
+    # ── public ────────────────────────────────────────────────────────────
+    def load(self, path: str):
+        self._path = path
+        name = display_name(path)
+        self._track_lbl.setText(name)
+        self._engine.set_device(self._dev_combo.currentText())
+        self._engine.load(path)
+        self._engine.play()
+        self._refresh_pts_list()
+
+        # Reset waveform display and start background loading
+        self._waveform.set_data(None)
+        # Load existing CUE points into waveform
+        pts = CUE_POINTS.get(path, [])
+        self._waveform.set_cues(pts)
+        if HAS_SF:
+            def _load_waveform():
+                try:
+                    data, sr = sf.read(path, dtype='float32', always_2d=True)
+                    # Convert to mono
+                    if data.ndim > 1:
+                        mono = data.mean(axis=1)
+                    else:
+                        mono = data
+                    # Divide into 1200 chunks, take max(abs()) per chunk
+                    n_chunks = 1200
+                    total    = len(mono)
+                    chunk_sz = max(1, total // n_chunks)
+                    peaks = []
+                    for i in range(n_chunks):
+                        start = i * chunk_sz
+                        end   = min(start + chunk_sz, total)
+                        if start >= total:
+                            peaks.append(0.0)
+                        else:
+                            chunk_data = mono[start:end]
+                            peaks.append(float(abs(chunk_data).max()))
+                    # Normalize
+                    mx = max(peaks) if peaks else 1.0
+                    if mx > 0:
+                        peaks = [v / mx for v in peaks]
+                    self.sig_waveform_ready.emit(peaks)
+                except Exception as ex:
+                    print(f"WaveformWidget load error: {ex}")
+            t = threading.Thread(target=_load_waveform, daemon=True)
+            t.start()
+
+    def clear(self):
+        self._engine.stop()
+        self._path = None
+        self._track_lbl.setText('—')
+        self._waveform.set_pos(0.0)
+        self._waveform.set_data(None)
+        self._waveform.set_cues([])
+        self._time_lbl.setText('00:00')
+        self._btn_play.setText('▶  PLAY')
+        self._pts_list.clear()
+
+    # ── slots ─────────────────────────────────────────────────────────────
+    def _toggle(self):
+        if self._engine.state == 'playing':
+            self._engine.pause()
+        else:
+            self._engine.play()
+
+    def _mark_cue(self):
+        if not self._path:
+            return
+        frac = self._cur_pos
+        dur  = self._engine.duration
+        secs = int(frac * dur)
+        pts  = self._cue_points.setdefault(self._path, [])
+        if frac not in pts:
+            pts.append(frac)
+            pts.sort()
+            CUE_POINTS[self._path] = list(pts)
+            self._waveform.set_cues(pts)
+            self._refresh_pts_list()
+            self.sig_cue_changed.emit(self._path)
+
+    def _refresh_pts_list(self):
+        self._pts_list.clear()
+        pts  = self._cue_points.get(self._path, [])
+        dur  = self._engine.duration
+        for i, frac in enumerate(pts):
+            secs = int(frac * dur)
+            m, s = secs // 60, secs % 60
+            item = QListWidgetItem(f"  CUE {i+1:02d}   {m:02d}:{s:02d}")
+            item.setData(Qt.ItemDataRole.UserRole, frac)
+            self._pts_list.addItem(item)
+
+    def _jump_to_cue(self, item: QListWidgetItem):
+        frac = item.data(Qt.ItemDataRole.UserRole)
+        self._engine.seek(frac)
+
+    def _clear_cue_points(self):
+        if self._path and self._path in self._cue_points:
+            self._cue_points[self._path] = []
+            CUE_POINTS[self._path] = []
+            self._waveform.set_cues([])
+            self._pts_list.clear()
+            self.sig_cue_changed.emit(self._path)
+
+    def _on_pos(self, frac: float):
+        self._cur_pos = frac
+        self._waveform.set_pos(frac)
+        dur = self._engine.duration
+        secs = int(frac * dur)
+        m, s = secs // 60, secs % 60
+        self._time_lbl.setText(f"{m:02d}:{s:02d}")
+
+    def _on_state(self, state: str):
+        if state == 'playing':
+            self._btn_play.setText('⏸  PAUSE')
+        else:
+            self._btn_play.setText('▶  PLAY')
+        if state == 'stopped':
+            self._waveform.set_pos(0.0)
+            self._time_lbl.setText('00:00')
+
+    def _on_dur(self, secs: int):
+        pass  # duration updated in engine; used via sig_pos
+
+    def _on_clear(self):
+        self.clear()
+        self.hide()
+
+    def closeEvent(self, ev):
+        # Hide instead of closing/destroying
+        ev.ignore()
+        self.hide()
 
 
 # ── VU Meter Analógico ────────────────────────────────────────────────────────
@@ -538,6 +1176,10 @@ class SongDelegate(QStyledItemDelegate):
 
     def paint(self, painter, option, index):
         playing = index.data(self.PLAYING_ROLE)
+        path = index.data(Qt.ItemDataRole.UserRole)  # SongItem._PATH_ROLE
+        has_cues = bool(path and path in CUE_POINTS and CUE_POINTS[path])
+        cue_count = len(CUE_POINTS.get(path, [])) if has_cues else 0
+
         if playing:
             painter.save()
             # Fundo verde-escuro sempre, independente de seleção/foco
@@ -547,14 +1189,38 @@ class SongDelegate(QStyledItemDelegate):
             font = option.font
             font.setBold(True)
             painter.setFont(font)
+            right_pad = 50 if has_cues else 4
             painter.drawText(
-                option.rect.adjusted(8, 0, -4, 0),
+                option.rect.adjusted(8, 0, -right_pad, 0),
                 Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                 index.data(Qt.ItemDataRole.DisplayRole) or ''
             )
             painter.restore()
         else:
-            super().paint(painter, option, index)
+            # Draw CUE badge padding before default paint so text doesn't overlap
+            if has_cues:
+                painter.save()
+                # Draw normal background first
+                super().paint(painter, option, index)
+                painter.restore()
+                # Overdraw text with reduced right margin handled via default paint
+                # (badge drawn below)
+            else:
+                super().paint(painter, option, index)
+
+        # Draw CUE badge on right side for any item with CUE points
+        if has_cues:
+            painter.save()
+            badge_text = f"◉ {cue_count}"
+            badge_font = QFont('Roboto', 9, QFont.Weight.Bold)
+            painter.setFont(badge_font)
+            painter.setPen(QColor('#00ccff'))
+            painter.drawText(
+                option.rect.adjusted(0, 0, -6, 0),
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
+                badge_text
+            )
+            painter.restore()
 
 
 # ── Playlist List ─────────────────────────────────────────────────────────────
@@ -587,6 +1253,7 @@ class SongItem(QListWidgetItem):
 
 class PlaylistPanel(QWidget):
     sig_play = pyqtSignal(str)
+    sig_cue  = pyqtSignal(str)
 
     def __init__(self, name: str, color: str, parent=None):
         super().__init__(parent)
@@ -795,6 +1462,7 @@ class PlaylistPanel(QWidget):
         """)
         if item:
             a_play   = menu.addAction('▶  Reproduzir')
+            a_cue    = menu.addAction('🎧  CUE')
             menu.addSeparator()
             a_rename = menu.addAction('✎  Renomear playlist')
             menu.addSeparator()
@@ -802,6 +1470,8 @@ class PlaylistPanel(QWidget):
             action = menu.exec(self._list.mapToGlobal(pos))
             if action == a_play:
                 self.sig_play.emit(item.path)
+            elif action == a_cue:
+                self.sig_cue.emit(item.path)
             elif action == a_rename:
                 self._rename()
             elif action == a_remove:
@@ -861,6 +1531,7 @@ class PlaylistPanel(QWidget):
 # ── Tab Page (grid configurável) ──────────────────────────────────────────────
 class TabPage(QWidget):
     sig_play = pyqtSignal(str)
+    sig_cue  = pyqtSignal(str)
 
     def __init__(self, idx: int, cols: int = 3, rows: int = 3, parent=None):
         super().__init__(parent)
@@ -881,6 +1552,7 @@ class TabPage(QWidget):
                 PANEL_HEADERS[i % len(PANEL_HEADERS)]
             )
             panel.sig_play.connect(self.sig_play)
+            panel.sig_cue.connect(self.sig_cue)
             self._panels.append(panel)
             g.addWidget(panel, r, c)
         for c in range(self._cols):  g.setColumnStretch(c, 1)
@@ -1285,11 +1957,13 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self._engine        = AudioEngine()
+        self._cue_engine    = CueEngine()
         self._current: str | None = None
         self._pages:   list[TabPage] = []
         self._cur_panel     = None   # PlaylistPanel com a música atual
         self._cur_row       = -1     # índice da música atual no painel
         self._build()
+        self._cue_window = CueWindow(self._cue_engine, self)
         self._wire()
         self._load()
         self.setWindowTitle('DJ Mix Player')
@@ -1457,7 +2131,7 @@ class MainWindow(QMainWindow):
         devs = self._engine.get_devices()
         self._dev_combo.addItems(devs)
         self._dev_combo.setFixedWidth(200)
-        self._dev_combo.setStyleSheet(f"""
+        _combo_style = f"""
             QComboBox{{
                 background:{C['panel']};
                 border:1px solid {C['border2']};
@@ -1473,8 +2147,25 @@ class MainWindow(QMainWindow):
                 selection-background-color:{C['sel']};
                 outline:none;
             }}
-        """)
+        """
+        self._dev_combo.setStyleSheet(_combo_style)
         tbl.addWidget(self._dev_combo)
+
+        # CUE output device selector
+        cue_lbl = QLabel('CUE')
+        cue_lbl.setStyleSheet(
+            f"color:{C['text_dim']};font-size:11px;letter-spacing:1px;")
+        tbl.addWidget(cue_lbl)
+
+        self._cue_combo = QComboBox()
+        cue_devs = self._engine.get_devices()
+        self._cue_combo.addItems(cue_devs)
+        self._cue_combo.setFixedWidth(200)
+        self._cue_combo.setStyleSheet(_combo_style)
+        self._cue_combo.currentTextChanged.connect(
+            lambda name: self._cue_engine.set_device(name))
+        tbl.addWidget(self._cue_combo)
+
         root.addWidget(topbar)
 
         # ── content area: sidebar + stack ────────────────────────────────
@@ -1538,6 +2229,7 @@ class MainWindow(QMainWindow):
         for i in range(8):
             page = TabPage(i, self._grid_cols, self._grid_rows)
             page.sig_play.connect(self._play)
+            page.sig_cue.connect(self._on_cue)
             self._pages.append(page)
             self._stack.addWidget(page)
         cl.addWidget(self._stack, 1)
@@ -1606,6 +2298,14 @@ class MainWindow(QMainWindow):
         t.sig_seek  .connect(e.seek)
         t.sig_volume.connect(e.set_volume)
 
+        self._cue_window.sig_cue_changed.connect(self._on_cue_changed)
+
+    def _on_cue_changed(self, path: str):
+        # Repaint all playlist lists so the CUE badge appears/updates
+        for pg in self._pages:
+            for panel in pg.get_panels():
+                panel._list.update()
+
     def _refresh_panel_styles(self):
         for pg in self._pages:
             for panel in pg.get_panels():
@@ -1666,6 +2366,7 @@ class MainWindow(QMainWindow):
         for i in range(8):
             page = TabPage(i, cols, rows)
             page.sig_play.connect(self._play)
+            page.sig_cue.connect(self._on_cue)
             self._pages.append(page)
             self._stack.addWidget(page)
             if i < len(saved):
@@ -1763,10 +2464,24 @@ class MainWindow(QMainWindow):
         for pg in self._pages:
             pg.filter(q)
 
+    def _on_cue(self, path: str):
+        self._cue_engine.set_device(self._cue_combo.currentText())
+        self._cue_window.load(path)
+        self._cue_window.show()
+        self._cue_window.raise_()
+
     # ── persistence ───────────────────────────────────────────────────────
     def _save(self):
         DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
-        data = [pg.to_dict() for pg in self._pages]
+        data = {
+            'playlists': [pg.to_dict() for pg in self._pages],
+            'settings': {
+                'main_device': self._dev_combo.currentText(),
+                'cue_device':  self._cue_combo.currentText(),
+                'grid_cols':   self._grid_cols,
+                'grid_rows':   self._grid_rows,
+            }
+        }
         with open(DATA_FILE, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
@@ -1775,15 +2490,48 @@ class MainWindow(QMainWindow):
             return
         try:
             with open(DATA_FILE, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            for i, pd in enumerate(data[:5]):
+                raw = json.load(f)
+
+            # suporte ao formato antigo (lista directa)
+            if isinstance(raw, list):
+                playlists, settings = raw, {}
+            else:
+                playlists = raw.get('playlists', [])
+                settings  = raw.get('settings', {})
+
+            for i, pd in enumerate(playlists[:len(self._pages)]):
                 self._pages[i].from_dict(pd)
+
+            # restaura dispositivo principal
+            main_dev = settings.get('main_device', '')
+            if main_dev:
+                idx = self._dev_combo.findText(main_dev)
+                if idx >= 0:
+                    self._dev_combo.setCurrentIndex(idx)
+
+            # restaura dispositivo CUE
+            cue_dev = settings.get('cue_device', '')
+            if cue_dev:
+                idx = self._cue_combo.findText(cue_dev)
+                if idx >= 0:
+                    self._cue_combo.setCurrentIndex(idx)
+
+            # restaura layout de grid
+            cols = settings.get('grid_cols', 3)
+            rows = settings.get('grid_rows', 3)
+            if (cols, rows) != (self._grid_cols, self._grid_rows):
+                self._set_grid_layout(cols, rows)
+                # recarrega playlists com o novo layout
+                for i, pd in enumerate(playlists[:len(self._pages)]):
+                    self._pages[i].from_dict(pd)
+
         except Exception as e:
             print(f"load data: {e}")
 
     def closeEvent(self, ev):
         self._save()
         self._engine.stop()
+        self._cue_engine.stop()
         if HAS_PYGAME:
             pygame.quit()
         ev.accept()
@@ -1795,6 +2543,10 @@ def main():
         print("AVISO: pygame não encontrado. Execute: pip install pygame")
     if not HAS_MUTAGEN:
         print("AVISO: mutagen não encontrado. Execute: pip install mutagen")
+    if not HAS_SD:
+        print("AVISO: sounddevice não encontrado. Execute: pip install sounddevice")
+    if not HAS_SF:
+        print("AVISO: soundfile não encontrado (necessário para CUE). Execute: pip install soundfile")
 
     app = QApplication(sys.argv)
     app.setApplicationName('DJ Mix Player')
