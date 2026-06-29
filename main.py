@@ -2274,12 +2274,138 @@ class TransportBar(QWidget):
 
 
 # ── Settings Dialog ───────────────────────────────────────────────────────────
+class MusicSearchDialog(QDialog):
+    sig_play      = pyqtSignal(str)
+    sig_scan_done = pyqtSignal(list)
+
+    def __init__(self, music_folder: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('Buscar Música')
+        self.setWindowModality(Qt.WindowModality.NonModal)
+        self.resize(640, 520)
+        self.setStyleSheet(f"background:{C['bg']};color:{C['text']};")
+        self._folder     = music_folder
+        self._all_files: list[str] = []
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 18, 20, 18)
+        root.setSpacing(10)
+
+        title = QLabel('BUSCAR MÚSICA')
+        title.setStyleSheet(
+            f"color:{C['accent_lt']};font-size:14px;font-weight:bold;letter-spacing:2px;")
+        root.addWidget(title)
+
+        self._folder_lbl = QLabel(f'Pasta: {music_folder or "(não configurada em ⚙ CONFIG.)"}')
+        self._folder_lbl.setStyleSheet(f"color:{C['text_dim']};font-size:10px;")
+        root.addWidget(self._folder_lbl)
+
+        _edit_style = f"""
+            QLineEdit{{
+                background:{C['panel']};border:1px solid {C['border2']};
+                border-radius:5px;color:{C['text']};padding:6px 10px;
+                font-size:13px;
+            }}
+            QLineEdit:focus{{border-color:{C['accent_lt']};}}
+        """
+        self._search_edit = QLineEdit()
+        self._search_edit.setPlaceholderText('BUSCAR...')
+        self._search_edit.setFixedHeight(36)
+        self._search_edit.setStyleSheet(_edit_style)
+        self._search_edit.textChanged.connect(self._filter)
+        self._search_edit.returnPressed.connect(self._play_selected)
+        root.addWidget(self._search_edit)
+
+        self._status_lbl = QLabel('Aguardando...')
+        self._status_lbl.setStyleSheet(f"color:{C['text_dim']};font-size:10px;")
+        root.addWidget(self._status_lbl)
+
+        self._list = QListWidget()
+        self._list.setStyleSheet(f"""
+            QListWidget{{
+                background:{C['panel']};border:1px solid {C['border']};
+                border-radius:5px;color:{C['text']};font-size:12px;
+                outline:none;
+            }}
+            QListWidget::item{{padding:6px 10px;border-bottom:1px solid {C['border']};}}
+            QListWidget::item:selected{{background:{C['sel']};color:white;}}
+            QListWidget::item:hover{{background:{C['hover']};}}
+        """)
+        self._list.itemDoubleClicked.connect(lambda item: self._emit_play(item))
+        self._list.activated.connect(lambda idx: self._emit_play(self._list.item(idx.row())))
+        root.addWidget(self._list, 1)
+
+        hint = QLabel('Duplo clique ou Enter para tocar')
+        hint.setStyleSheet(f"color:{C['text_dim']};font-size:10px;")
+        root.addWidget(hint)
+
+        self.sig_scan_done.connect(self._on_scan_done)
+
+        if music_folder and Path(music_folder).is_dir():
+            self._start_scan(music_folder)
+        else:
+            self._status_lbl.setText('Pasta não configurada. Defina em ⚙ CONFIG. e reabra a busca.')
+
+    def set_folder(self, folder: str):
+        self._folder = folder
+        self._folder_lbl.setText(f'Pasta: {folder or "(não configurada)"}')
+        self._all_files = []
+        self._list.clear()
+        self._status_lbl.setText('Buscando arquivos...')
+        if folder and Path(folder).is_dir():
+            self._start_scan(folder)
+
+    def _start_scan(self, folder: str):
+        self._status_lbl.setText('Buscando arquivos...')
+        def _scan():
+            results = []
+            try:
+                for p in Path(folder).rglob('*'):
+                    if p.is_file() and p.suffix.lower() in AUDIO_EXTENSIONS:
+                        results.append(str(p))
+            except Exception:
+                pass
+            self.sig_scan_done.emit(sorted(results, key=lambda x: Path(x).name.lower()))
+        threading.Thread(target=_scan, daemon=True).start()
+
+    def _on_scan_done(self, paths: list):
+        self._all_files = paths
+        self._status_lbl.setText(f'{len(paths)} arquivo{"s" if len(paths) != 1 else ""} encontrado{"s" if len(paths) != 1 else ""}')
+        self._filter(self._search_edit.text())
+
+    def _filter(self, text: str):
+        self._list.clear()
+        term = text.lower().strip()
+        for path in self._all_files:
+            name = Path(path).name
+            if not term or term in name.lower():
+                item = QListWidgetItem(display_name(path))
+                item.setData(Qt.ItemDataRole.UserRole, path)
+                item.setToolTip(path)
+                self._list.addItem(item)
+        count = self._list.count()
+        total = len(self._all_files)
+        if term:
+            self._status_lbl.setText(f'{count} de {total} arquivos')
+
+    def _emit_play(self, item):
+        if item:
+            path = item.data(Qt.ItemDataRole.UserRole)
+            if path:
+                self.sig_play.emit(path)
+
+    def _play_selected(self):
+        self._emit_play(self._list.currentItem())
+
+
 class SettingsDialog(QDialog):
-    def __init__(self, devices: list, main_device: str, cue_device: str, parent=None):
+    def __init__(self, devices: list, main_device: str, cue_device: str,
+                 music_folder: str = '', parent=None):
         super().__init__(parent)
         self.setWindowTitle('Configurações')
         self.setModal(True)
-        self.setFixedSize(460, 230)
+        self.setFixedSize(520, 300)
+        self.setStyleSheet(f"background:{C['bg']};color:{C['text']};")
         _combo_style = f"""
             QComboBox{{
                 background:{C['panel']};
@@ -2335,6 +2461,33 @@ class SettingsDialog(QDialog):
         form.addWidget(lbl_cue, 1, 0)
         form.addWidget(self._cue_combo, 1, 1)
 
+        lbl_folder = QLabel('PASTA MÚSICAS')
+        lbl_folder.setStyleSheet(f"color:{C['text_dim']};font-size:12px;letter-spacing:1px;")
+        folder_row = QHBoxLayout()
+        folder_row.setSpacing(6)
+        self._folder_edit = QLineEdit()
+        self._folder_edit.setReadOnly(True)
+        self._folder_edit.setText(music_folder)
+        self._folder_edit.setPlaceholderText('(nenhuma pasta selecionada)')
+        self._folder_edit.setStyleSheet(f"""
+            QLineEdit{{
+                background:{C['panel']};border:1px solid {C['border2']};
+                border-radius:5px;color:{C['text']};padding:5px 10px;font-size:12px;
+            }}
+        """)
+        btn_browse = QPushButton('...')
+        btn_browse.setFixedSize(34, 34)
+        btn_browse.setStyleSheet(f"""
+            QPushButton{{background:{C['panel2']};color:{C['text']};
+                border:1px solid {C['border2']};border-radius:5px;font-weight:bold;}}
+            QPushButton:hover{{background:{C['hover']};border-color:{C['accent_lt']};}}
+        """)
+        btn_browse.clicked.connect(self._browse_folder)
+        folder_row.addWidget(self._folder_edit)
+        folder_row.addWidget(btn_browse)
+        form.addWidget(lbl_folder, 2, 0)
+        form.addLayout(folder_row, 2, 1)
+
         root.addLayout(form)
         root.addStretch()
 
@@ -2351,11 +2504,20 @@ class SettingsDialog(QDialog):
         btn_row.addWidget(btn_ok)
         root.addLayout(btn_row)
 
+    def _browse_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, 'Selecionar pasta de músicas',
+                                                  self._folder_edit.text() or str(Path.home()))
+        if folder:
+            self._folder_edit.setText(folder)
+
     def main_device(self) -> str:
         return self._main_combo.currentText()
 
     def cue_device(self) -> str:
         return self._cue_combo.currentText()
+
+    def music_folder(self) -> str:
+        return self._folder_edit.text()
 
 
 # ── Main Window ───────────────────────────────────────────────────────────────
@@ -2368,8 +2530,10 @@ class MainWindow(QMainWindow):
         self._pages:   list[TabPage] = []
         self._cur_panel     = None   # PlaylistPanel com a música atual
         self._cur_row       = -1     # índice da música atual no painel
-        self._main_device: str = ''
-        self._cue_device: str = ''
+        self._main_device:  str = ''
+        self._cue_device:   str = ''
+        self._music_folder: str = ''
+        self._search_dlg: MusicSearchDialog | None = None
         self._focused: str | None = None   # song with keyboard/mouse focus
         self._build()
         self._cue_window = CueWindow(self._cue_engine, self)
@@ -2509,6 +2673,32 @@ class MainWindow(QMainWindow):
             b.setStyleSheet(_cue_btn_style)
             self._cue_btns.append(b)
             tbl.addWidget(b)
+
+        tbl.addSpacing(12)
+
+        # Buscar música button
+        self._btn_search = QPushButton('🔍  BUSCAR MÚSICA')
+        self._btn_search.setFixedHeight(34)
+        self._btn_search.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._btn_search.setStyleSheet(f"""
+            QPushButton{{
+                background:{C['panel2']};
+                color:{C['text']};
+                border:1px solid {C['border2']};
+                border-radius:5px;
+                font-size:11px;
+                font-weight:bold;
+                letter-spacing:1px;
+                padding:0 14px;
+            }}
+            QPushButton:hover{{
+                background:{C['hover']};
+                color:{C['accent_lt']};
+                border-color:{C['accent_lt']};
+            }}
+        """)
+        self._btn_search.clicked.connect(self._open_search)
+        tbl.addWidget(self._btn_search)
 
         tbl.addStretch()
 
@@ -2942,12 +3132,26 @@ class MainWindow(QMainWindow):
             devices=self._cue_engine.get_devices(),
             main_device=self._main_device,
             cue_device=self._cue_device,
+            music_folder=self._music_folder,
             parent=self,
         )
         if dlg.exec():
-            self._main_device = dlg.main_device()
-            self._cue_device  = dlg.cue_device()
+            self._main_device  = dlg.main_device()
+            self._cue_device   = dlg.cue_device()
+            new_folder         = dlg.music_folder()
             self._cue_engine.set_device(self._cue_device)
+            if new_folder != self._music_folder:
+                self._music_folder = new_folder
+                if self._search_dlg and self._search_dlg.isVisible():
+                    self._search_dlg.set_folder(new_folder)
+
+    def _open_search(self):
+        if not self._search_dlg:
+            self._search_dlg = MusicSearchDialog(self._music_folder, parent=self)
+            self._search_dlg.sig_play.connect(self._play)
+        self._search_dlg.show()
+        self._search_dlg.raise_()
+        self._search_dlg.activateWindow()
 
     def _on_cue(self, path: str):
         self._cue_engine.set_device(self._cue_device)
@@ -2971,10 +3175,11 @@ class MainWindow(QMainWindow):
         data = {
             'playlists': [pg.to_dict() for pg in self._pages],
             'settings': {
-                'main_device': self._main_device,
-                'cue_device':  self._cue_device,
-                'grid_cols':   self._grid_cols,
-                'grid_rows':   self._grid_rows,
+                'main_device':  self._main_device,
+                'cue_device':   self._cue_device,
+                'music_folder': self._music_folder,
+                'grid_cols':    self._grid_cols,
+                'grid_rows':    self._grid_rows,
             },
             'cue_points':  cue_to_save,
             'cue_fadein':  fadein_to_save,
@@ -2999,9 +3204,10 @@ class MainWindow(QMainWindow):
             for i, pd in enumerate(playlists[:len(self._pages)]):
                 self._pages[i].from_dict(pd)
 
-            # restaura dispositivos
-            self._main_device = settings.get('main_device', '')
-            self._cue_device  = settings.get('cue_device', '')
+            # restaura dispositivos e pasta
+            self._main_device  = settings.get('main_device', '')
+            self._cue_device   = settings.get('cue_device', '')
+            self._music_folder = settings.get('music_folder', '')
             if self._cue_device:
                 self._cue_engine.set_device(self._cue_device)
 
