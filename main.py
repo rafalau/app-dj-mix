@@ -53,16 +53,24 @@ except ImportError:
 AUDIO_EXTENSIONS = {'.mp3', '.mpa', '.wav', '.flac', '.ogg', '.aac', '.m4a', '.wma', '.opus', '.mp2', '.mp4'}
 FORMATS_FILTER = "Áudio (*.mp3 *.mpa *.wav *.flac *.ogg *.aac *.m4a *.wma *.opus *.mp2 *.mp4);;Todos (*.*)"
 
-CUE_POINTS: dict[str, list] = {}  # path → [frac_or_None] × 5, index 0 = CUE 1
+CUE_POINTS:  dict[str, list] = {}  # path → [frac_or_None] × 5
+CUE_FADEIN:  dict[str, list] = {}  # path → [bool] × 5, True = fade-in ativo
 
 
 def _cue_slots(path: str) -> list:
-    """Return (and create if needed) the 5-slot CUE list for path."""
     if path not in CUE_POINTS:
         CUE_POINTS[path] = [None] * 5
     elif len(CUE_POINTS[path]) < 5:
         CUE_POINTS[path] = (CUE_POINTS[path] + [None] * 5)[:5]
     return CUE_POINTS[path]
+
+
+def _cue_fadein(path: str) -> list:
+    if path not in CUE_FADEIN:
+        CUE_FADEIN[path] = [True] * 5
+    elif len(CUE_FADEIN[path]) < 5:
+        CUE_FADEIN[path] = (CUE_FADEIN[path] + [True] * 5)[:5]
+    return CUE_FADEIN[path]
 
 C = {
     'bg':        '#111111',
@@ -809,10 +817,15 @@ class CueWindow(QDialog):
 
         cue_row = QHBoxLayout()
         cue_row.setSpacing(8)
-        self._cue_slot_btns: list[QPushButton] = []
+        self._cue_slot_btns:  list[QPushButton] = []
+        self._cue_fade_btns:  list[QPushButton] = []
         CUE_SLOT_COLORS = ['#b8860b', '#b85000', '#007744', '#6600aa', '#aa0033']
         for i in range(5):
             col = CUE_SLOT_COLORS[i]
+
+            col_layout = QVBoxLayout()
+            col_layout.setSpacing(3)
+
             btn = QPushButton(f'CUE {i+1}\n  — : —  ')
             btn.setFixedHeight(54)
             btn.setMinimumWidth(130)
@@ -839,7 +852,19 @@ class CueWindow(QDialog):
             btn.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             btn.customContextMenuRequested.connect(lambda pos, idx=i: self._slot_ctx(idx))
             self._cue_slot_btns.append(btn)
-            cue_row.addWidget(btn)
+            col_layout.addWidget(btn)
+
+            fade_btn = QPushButton('FADE IN  ✓')
+            fade_btn.setFixedHeight(20)
+            fade_btn.setCheckable(True)
+            fade_btn.setChecked(True)
+            fade_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            self._apply_fade_btn_style(fade_btn, True)
+            fade_btn.toggled.connect(lambda checked, idx=i: self._fade_toggled(idx, checked))
+            self._cue_fade_btns.append(fade_btn)
+            col_layout.addWidget(fade_btn)
+
+            cue_row.addLayout(col_layout)
         root.addLayout(cue_row)
 
         # bottom row: info + limpar todos
@@ -885,6 +910,12 @@ class CueWindow(QDialog):
         slots = _cue_slots(path)
         self._waveform.set_cues(slots)
         self._refresh_slot_buttons()
+        fi = _cue_fadein(path)
+        for idx, fb in enumerate(self._cue_fade_btns):
+            fb.blockSignals(True)
+            fb.setChecked(fi[idx])
+            self._apply_fade_btn_style(fb, fi[idx])
+            fb.blockSignals(False)
         def _load_wf():
             import numpy as np
             data = None
@@ -1054,6 +1085,35 @@ class CueWindow(QDialog):
         m, s = secs // 60, secs % 60
         self._dur_lbl.setText(f"/ {m:02d}:{s:02d}")
         self._refresh_slot_buttons()
+
+    def _apply_fade_btn_style(self, btn: QPushButton, checked: bool):
+        if checked:
+            btn.setText('FADE IN  ✓')
+            btn.setStyleSheet(f"""
+                QPushButton{{
+                    background:#1a3a1a;color:#44dd88;
+                    border:1px solid #2a6a2a;border-radius:3px;
+                    font-size:9px;font-weight:bold;letter-spacing:1px;
+                }}
+                QPushButton:hover{{background:#224422;}}
+            """)
+        else:
+            btn.setText('FADE IN  ✗')
+            btn.setStyleSheet(f"""
+                QPushButton{{
+                    background:{C['panel']};color:{C['text_dim']};
+                    border:1px solid {C['border']};border-radius:3px;
+                    font-size:9px;font-weight:bold;letter-spacing:1px;
+                }}
+                QPushButton:hover{{background:{C['hover']};color:{C['text']};}}
+            """)
+
+    def _fade_toggled(self, idx: int, checked: bool):
+        if self._path:
+            fi = _cue_fadein(self._path)
+            fi[idx] = checked
+            CUE_FADEIN[self._path] = fi
+        self._apply_fade_btn_style(self._cue_fade_btns[idx], checked)
 
     def _clear_all_cues(self):
         if not self._path:
@@ -2691,14 +2751,16 @@ class MainWindow(QMainWindow):
             self._transport.set_song(name)
             for pg in self._pages:
                 pg.set_playing(path)
-        # Zero volume BEFORE seek/play so there's no blip at full volume
-        target_vol = self._engine._volume
-        self._engine.set_volume(0.0)
+        use_fade = _cue_fadein(path)[idx]
         was_playing = self._engine.state == 'playing'
+        if use_fade:
+            target_vol = self._engine._volume
+            self._engine.set_volume(0.0)
         self._engine.seek(frac)
         if not was_playing:
             self._engine.play()
-        self._fade_in(target_vol)
+        if use_fade:
+            self._fade_in(target_vol)
         self._refresh_cue_buttons()
 
     def _fade_in(self, target: float = None, duration_ms: int = 1200):
@@ -2901,6 +2963,11 @@ class MainWindow(QMainWindow):
             for path, slots in CUE_POINTS.items()
             if any(v is not None for v in slots)
         }
+        fadein_to_save = {
+            path: flags
+            for path, flags in CUE_FADEIN.items()
+            if path in cue_to_save and not all(flags)
+        }
         data = {
             'playlists': [pg.to_dict() for pg in self._pages],
             'settings': {
@@ -2909,7 +2976,8 @@ class MainWindow(QMainWindow):
                 'grid_cols':   self._grid_cols,
                 'grid_rows':   self._grid_rows,
             },
-            'cue_points': cue_to_save,
+            'cue_points':  cue_to_save,
+            'cue_fadein':  fadein_to_save,
         }
         with open(DATA_FILE, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -2943,6 +3011,13 @@ class MainWindow(QMainWindow):
                 if isinstance(slots, list):
                     normalized = [(float(v) if v is not None else None) for v in slots]
                     CUE_POINTS[path] = (normalized + [None]*5)[:5]
+
+            # restaura flags de fade-in (ausente = todos True por padrão)
+            fadein_data = raw.get('cue_fadein', {}) if isinstance(raw, dict) else {}
+            for path, flags in fadein_data.items():
+                if isinstance(flags, list):
+                    normalized_fi = [bool(v) for v in flags]
+                    CUE_FADEIN[path] = (normalized_fi + [True]*5)[:5]
 
             # restaura layout de grid
             cols = settings.get('grid_cols', 3)
