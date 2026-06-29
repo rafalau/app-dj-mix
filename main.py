@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QMimeData, QUrl, QPointF, QRectF, QSize
 from PyQt6.QtGui import (QPainter, QColor, QLinearGradient, QRadialGradient, QFont,
                          QDragEnterEvent, QDropEvent, QPolygonF, QFontDatabase,
-                         QPixmap, QIcon, QPen)
+                         QPixmap, QIcon, QPen, QShortcut, QKeySequence)
 
 # ── Optional backends ─────────────────────────────────────────────────────────
 try:
@@ -80,6 +80,12 @@ def _flat_icon(kind: str, size: int = 16, color: str = '#ffffff') -> QIcon:
         m = int(size * 0.18)
         p.drawLine(m, m, size - m, size - m)
         p.drawLine(size - m, m, m, size - m)
+
+    elif kind == 'stop':
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(color))
+        m = int(size * 0.22)
+        p.drawRect(m, m, size - m * 2, size - m * 2)
 
     p.end()
     return QIcon(px)
@@ -2456,10 +2462,55 @@ class TransportBar(QWidget):
             self._elapsed.setText('00:00')
 
 
+class SFXEngine:
+    """Toca efeitos de sonoplastia via pygame (independente do engine principal)."""
+    def __init__(self):
+        self._slots: list[str | None] = [None] * 50
+        self._active_idx: int | None   = None
+        self._active_sound              = None  # pygame.mixer.Sound em reprodução
+
+    def set_slot(self, idx: int, path: str | None):
+        self._slots[idx] = path
+
+    def get_slot(self, idx: int) -> str | None:
+        return self._slots[idx]
+
+    @property
+    def active_idx(self) -> int | None:
+        return self._active_idx
+
+    def stop(self):
+        """Para o som ativo (se houver)."""
+        if self._active_sound is not None:
+            try:
+                self._active_sound.stop()
+            except Exception:
+                pass
+        self._active_sound = None
+        self._active_idx   = None
+
+    def play(self, idx: int) -> float:
+        """Para qualquer som ativo, toca o slot idx e retorna duração (0 se falhar)."""
+        self.stop()
+        path = self._slots[idx]
+        if not path or not HAS_PYGAME:
+            return 0.0
+        try:
+            sound = pygame.mixer.Sound(path)
+            sound.play()
+            self._active_sound = sound
+            self._active_idx   = idx
+            return sound.get_length()
+        except Exception as e:
+            print(f"SFX: {e}")
+            return 0.0
+
+
 # ── Settings Dialog ───────────────────────────────────────────────────────────
 class MusicSearchDialog(QDialog):
     sig_play = pyqtSignal(str)
     sig_add  = pyqtSignal(str, int)   # path, índice global do painel
+    sig_sfx  = pyqtSignal(str, int)   # path, índice do slot SFX
 
     MAX_RESULTS = 300
 
@@ -2469,6 +2520,7 @@ class MusicSearchDialog(QDialog):
         self.setWindowModality(Qt.WindowModality.NonModal)
         self.resize(640, 520)
         self._playlist_names: list[str] = []
+        self._sfx_names: list[str] = [''] * 50
         self.setStyleSheet(f"background:{C['bg']};color:{C['text']};")
         self._folder     = music_folder
         self._all_files: list[str] = []
@@ -2643,6 +2695,9 @@ class MusicSearchDialog(QDialog):
     def set_playlists(self, names: list[str]):
         self._playlist_names = names
 
+    def set_sfx_names(self, names: list[str]):
+        self._sfx_names = names
+
     def _ctx_menu(self, pos):
         item = self._list.itemAt(pos)
         if not item:
@@ -2663,6 +2718,22 @@ class MusicSearchDialog(QDialog):
         add_actions = []
         for i, name in enumerate(self._playlist_names):
             add_actions.append((menu.addAction(f'+ Adicionar a  {name}'), i))
+        menu.addSeparator()
+        sfx_actions = []
+        mnu_style = f"""
+            QMenu{{background:{C['panel2']};border:1px solid {C['border2']};
+                   color:{C['text']};padding:4px;}}
+            QMenu::item{{padding:6px 18px;border-radius:3px;font-size:13px;}}
+            QMenu::item:selected{{background:{C['sel']};}}
+            QMenu::separator{{height:1px;background:{C['border2']};margin:3px 0;}}
+        """
+        for tab_i, tab_letter in enumerate('ABCDE'):
+            sub = menu.addMenu(f'🎵  Sonoplastia {tab_letter}')
+            sub.setStyleSheet(mnu_style)
+            for local in range(10):
+                abs_i = tab_i * 10 + local
+                label = self._sfx_names[abs_i] if self._sfx_names[abs_i] else '— vazio —'
+                sfx_actions.append((sub.addAction(f'{tab_letter}{local}  [{label}]'), abs_i))
         action = menu.exec(self._list.viewport().mapToGlobal(pos))
         if action == act_play:
             self.sig_play.emit(path)
@@ -2670,7 +2741,11 @@ class MusicSearchDialog(QDialog):
             for act, idx in add_actions:
                 if action == act:
                     self.sig_add.emit(path, idx)
-                    break
+                    return
+            for act, idx in sfx_actions:
+                if action == act:
+                    self.sig_sfx.emit(path, idx)
+                    return
 
     def _on_item_activated(self, item):
         if item:
@@ -2819,6 +2894,22 @@ class MainWindow(QMainWindow):
         self._music_folder: str = ''
         self._search_dlg: MusicSearchDialog | None = None
         self._focused: str | None = None   # song with keyboard/mouse focus
+        self._sfx_engine      = SFXEngine()
+        self._sfx_orig_vol: float = 0.8
+        self._sfx_ducked:   bool  = False
+        self._sfx_btns:     list  = []
+        self._sfx_tab_btns: list  = []
+        self._sfx_page:     int   = 0
+        self._sfx_pending_idx: int | None = None
+        self._sfx_fade_dir: str   = 'out'
+        self._sfx_fade_target: float = 0.0
+        self._sfx_fade_step:   float = 0.0
+        self._sfx_fade_timer  = QTimer(self)
+        self._sfx_fade_timer.setInterval(25)
+        self._sfx_fade_timer.timeout.connect(self._sfx_fade_tick)
+        self._sfx_restore_timer = QTimer(self)
+        self._sfx_restore_timer.setSingleShot(True)
+        self._sfx_restore_timer.timeout.connect(self._sfx_on_ended)
         self._build()
         self._cue_window = CueWindow(self._cue_engine, self)
         self._wire()
@@ -3101,26 +3192,69 @@ class MainWindow(QMainWindow):
         vsep.setStyleSheet(f"color:{C['border2']};margin:10px 0;")
         bl.addWidget(vsep)
 
-        # VU container — barras horizontais no topo + analógicos embaixo
+        # VU + Sonoplastia
         vu_wrap = QWidget()
-        vu_wrap.setFixedWidth(420)
+        vu_wrap.setFixedWidth(540)
         vu_root = QVBoxLayout(vu_wrap)
-        vu_root.setContentsMargins(6, 0, 6, 4)
-        vu_root.setSpacing(2)
+        vu_root.setContentsMargins(6, 4, 6, 4)
+        vu_root.setSpacing(4)
 
         self._hvu_l = HDigitalVUBar('L')
         self._hvu_r = HDigitalVUBar('R')
         vu_root.addWidget(self._hvu_l)
         vu_root.addWidget(self._hvu_r)
 
-        self._vu_l = VUMeter('L')
-        self._vu_r = VUMeter('R')
-        analog_row = QHBoxLayout()
-        analog_row.setSpacing(3)
-        analog_row.setContentsMargins(0, 10, 0, 0)
-        analog_row.addWidget(self._vu_l)
-        analog_row.addWidget(self._vu_r)
-        vu_root.addLayout(analog_row)
+        # ── Sonoplastia: header com abas ─────────────────────────────────
+        sfx_header = QWidget()
+        sfx_h = QHBoxLayout(sfx_header)
+        sfx_h.setContentsMargins(0, 0, 0, 0)
+        sfx_h.setSpacing(4)
+        sfx_lbl = QLabel('SONOPLASTIA')
+        sfx_lbl.setStyleSheet(
+            f"color:{C['text_dim']};font-size:9px;font-weight:bold;letter-spacing:2px;")
+        sfx_h.addWidget(sfx_lbl)
+        sfx_h.addStretch()
+        btn_stop = QPushButton(' STOP')
+        btn_stop.setIcon(_flat_icon('stop', 10, '#ff4444'))
+        btn_stop.setIconSize(QSize(10, 10))
+        btn_stop.setFixedSize(46, 16)
+        btn_stop.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        btn_stop.setStyleSheet(
+            f"QPushButton{{background:#5a0000;color:#ff4444;"
+            f"border:1px solid #aa0000;border-radius:3px;"
+            f"font-size:7px;font-weight:bold;padding:0;}}"
+            f"QPushButton:hover{{background:#7a0000;border-color:#ff4444;}}")
+        btn_stop.clicked.connect(self._sfx_stop_all)
+        sfx_h.addWidget(btn_stop)
+        sfx_h.addSpacing(4)
+        self._sfx_tab_btns = []
+        for pi, letter in enumerate('ABCDE'):
+            tb = QPushButton(letter)
+            tb.setFixedSize(22, 16)
+            tb.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            tb.setStyleSheet(self._sfx_tab_style(pi == 0))
+            tb.clicked.connect(lambda _, p=pi: self._sfx_page_switch(p))
+            self._sfx_tab_btns.append(tb)
+            sfx_h.addWidget(tb)
+        vu_root.addWidget(sfx_header)
+
+        # ── 10 botões da aba atual (2 linhas × 5) ────────────────────────
+        sfx_grid = QGridLayout()
+        sfx_grid.setSpacing(4)
+        sfx_grid.setContentsMargins(0, 0, 0, 0)
+        self._sfx_btns = []
+        for i in range(10):
+            btn = QPushButton(f'{i}\n— vazio —')
+            btn.setFixedHeight(38)
+            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            btn.setStyleSheet(self._sfx_btn_style(None))
+            btn.clicked.connect(lambda _, idx=i: self._play_sfx(idx))
+            btn.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            btn.customContextMenuRequested.connect(
+                lambda pos, idx=i, b=btn: self._sfx_ctx(idx, b))
+            self._sfx_btns.append(btn)
+            sfx_grid.addWidget(btn, i // 5, i % 5)
+        vu_root.addLayout(sfx_grid)
 
         bl.addWidget(vu_wrap)
 
@@ -3148,6 +3282,11 @@ class MainWindow(QMainWindow):
 
         for i, b in enumerate(self._cue_btns):
             b.clicked.connect(lambda _, idx=i: self._on_cue_btn(idx))
+
+        for i in range(10):
+            sc = QShortcut(QKeySequence(str(i)), self)
+            sc.setContext(Qt.ShortcutContext.WindowShortcut)
+            sc.activated.connect(lambda idx=i: self._play_sfx(idx))
 
     def _on_cue_changed(self, path: str):
         # Repaint all playlist lists so the CUE badge appears/updates
@@ -3378,8 +3517,6 @@ class MainWindow(QMainWindow):
         self._transport.set_pos(frac, self._engine.pos_seconds())
 
     def _on_vu(self, l: float, r: float):
-        self._vu_l.set_level(l)
-        self._vu_r.set_level(r)
         self._hvu_l.set_level(l)
         self._hvu_r.set_level(r)
 
@@ -3447,6 +3584,180 @@ class MainWindow(QMainWindow):
                 if self._search_dlg:
                     self._search_dlg.set_folder(new_folder)
 
+    def _sfx_tab_style(self, active: bool) -> str:
+        if active:
+            return (f"QPushButton{{background:{C['accent']};color:#000000;"
+                    f"border:none;border-radius:3px;"
+                    f"font-size:8px;font-weight:bold;padding:0;}}"
+                    f"QPushButton:hover{{background:{C['accent']};}}")
+        return (f"QPushButton{{background:{C['panel2']};color:{C['text_dim']};"
+                f"border:1px solid {C['border']};border-radius:3px;"
+                f"font-size:8px;font-weight:bold;padding:0;}}"
+                f"QPushButton:hover{{background:{C['hover']};color:{C['text']};}}")
+
+    def _sfx_stop_all(self):
+        self._sfx_restore_timer.stop()
+        self._sfx_fade_timer.stop()
+        prev = self._sfx_engine.active_idx
+        self._sfx_engine.stop()
+        if prev is not None:
+            self._sfx_refresh_btn(prev)
+        self._sfx_start_fade_in()
+
+    def _sfx_page_switch(self, page: int):
+        self._sfx_page = page
+        for i, tb in enumerate(self._sfx_tab_btns):
+            tb.setStyleSheet(self._sfx_tab_style(i == page))
+        for i in range(10):
+            self._sfx_refresh_btn(page * 10 + i)
+
+    def _sfx_btn_style(self, path: str | None, playing: bool = False) -> str:
+        if playing:
+            return (
+                f"QPushButton{{background:#3a1a1a;color:#ff6644;"
+                f"border:2px solid #ff4422;border-radius:4px;"
+                f"font-size:9px;font-weight:bold;text-align:center;padding:2px;}}"
+                f"QPushButton:hover{{background:#4a2222;border-color:#ff6644;}}"
+            )
+        if path:
+            return (
+                f"QPushButton{{background:#1a3a1a;color:#44dd88;"
+                f"border:1px solid #2a5a2a;border-radius:4px;"
+                f"font-size:9px;font-weight:bold;text-align:center;padding:2px;}}"
+                f"QPushButton:hover{{background:#224422;border-color:#44dd88;}}"
+            )
+        return (
+            f"QPushButton{{background:{C['panel']};color:{C['text_dim']};"
+            f"border:1px solid {C['border']};border-radius:4px;"
+            f"font-size:9px;font-weight:bold;text-align:center;padding:2px;}}"
+            f"QPushButton:hover{{background:{C['hover']};color:{C['text']};}}"
+        )
+
+    def _sfx_refresh_btn(self, abs_idx: int):
+        page  = abs_idx // 10
+        local = abs_idx % 10
+        if page != self._sfx_page:
+            return
+        path    = self._sfx_engine.get_slot(abs_idx)
+        playing = (self._sfx_engine.active_idx == abs_idx)
+        btn     = self._sfx_btns[local]
+        name    = display_name(path) if path else '— vazio —'
+        if len(name) > 14:
+            name = name[:13] + '…'
+        btn.setText(f'{local}\n{name}')
+        btn.setStyleSheet(self._sfx_btn_style(path, playing))
+
+    def _sfx_ctx(self, local_idx: int, btn: QPushButton):
+        abs_idx  = self._sfx_page * 10 + local_idx
+        tab_lbl  = 'ABCDE'[self._sfx_page]
+        slot_lbl = f'{tab_lbl}{local_idx}'
+        menu = QMenu(self)
+        menu.setStyleSheet(f"""
+            QMenu{{background:{C['panel2']};border:1px solid {C['border2']};
+                   color:{C['text']};padding:4px;}}
+            QMenu::item{{padding:6px 18px;border-radius:3px;}}
+            QMenu::item:selected{{background:{C['sel']};}}
+        """)
+        a_set   = menu.addAction(f'🎵  Escolher arquivo para slot {slot_lbl}')
+        a_clear = menu.addAction(f'✕  Limpar slot {slot_lbl}')
+        action  = menu.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
+        if action == a_set:
+            path, _ = QFileDialog.getOpenFileName(
+                self, f'Escolher som para slot {slot_lbl}',
+                '', FORMATS_FILTER)
+            if path:
+                self._sfx_set_slot(abs_idx, path)
+        elif action == a_clear:
+            self._sfx_set_slot(abs_idx, None)
+
+    def _sfx_set_slot(self, idx: int, path: str | None):
+        self._sfx_engine.set_slot(idx, path)
+        self._sfx_refresh_btn(idx)
+        if self._search_dlg:
+            names = list(self._search_dlg._sfx_names)
+            names[idx] = display_name(path) if path else ''
+            self._search_dlg.set_sfx_names(names)
+
+    _SFX_FADE_OUT_STEPS =  8   # × 25 ms =  200 ms (duck rápido)
+    _SFX_FADE_IN_STEPS  = 40   # × 25 ms = 1000 ms (restore suave)
+
+    def _play_sfx(self, local_idx: int):
+        idx = self._sfx_page * 10 + local_idx
+        if not self._sfx_engine.get_slot(idx):
+            return
+        # toggle: clicou no que já está tocando → para com fade in
+        if self._sfx_engine.active_idx == idx:
+            self._sfx_restore_timer.stop()
+            self._sfx_fade_timer.stop()
+            prev = idx
+            self._sfx_engine.stop()
+            self._sfx_refresh_btn(prev)
+            self._sfx_start_fade_in()
+            return
+        # cancela fade/timer anteriores
+        self._sfx_restore_timer.stop()
+        self._sfx_fade_timer.stop()
+        prev = self._sfx_engine.active_idx
+        if prev is not None:
+            self._sfx_engine.stop()
+            self._sfx_refresh_btn(prev)
+        # salva volume original (só uma vez enquanto ducked)
+        if not self._sfx_ducked:
+            self._sfx_orig_vol = self._engine._volume
+            self._sfx_ducked   = True
+        self._sfx_pending_idx = idx
+        self._sfx_start_fade_out()
+
+    def _sfx_start_fade_out(self):
+        cur    = self._engine._volume
+        target = self._sfx_orig_vol * 0.25
+        diff   = cur - target
+        self._sfx_fade_target = target
+        self._sfx_fade_step   = diff / self._SFX_FADE_OUT_STEPS if diff > 0 else 0
+        self._sfx_fade_dir    = 'out'
+        self._sfx_fade_timer.start()
+
+    def _sfx_start_fade_in(self):
+        cur    = self._engine._volume
+        target = self._sfx_orig_vol
+        diff   = target - cur
+        self._sfx_fade_target = target
+        self._sfx_fade_step   = diff / self._SFX_FADE_IN_STEPS if diff > 0 else 0
+        self._sfx_fade_dir    = 'in'
+        self._sfx_fade_timer.start()
+
+    def _sfx_fade_tick(self):
+        if self._sfx_fade_dir == 'out':
+            new_vol = max(self._sfx_fade_target,
+                          self._engine._volume - self._sfx_fade_step)
+            self._engine.set_volume(new_vol)
+            if new_vol <= self._sfx_fade_target + 0.001:
+                self._sfx_fade_timer.stop()
+                self._engine.set_volume(self._sfx_fade_target)
+                idx = self._sfx_pending_idx
+                dur = self._sfx_engine.play(idx)
+                self._sfx_refresh_btn(idx)
+                if dur <= 0:
+                    self._sfx_start_fade_in()
+                    return
+                self._sfx_restore_timer.start(int(dur * 1000) + 50)
+        elif self._sfx_fade_dir == 'in':
+            new_vol = min(self._sfx_fade_target,
+                          self._engine._volume + self._sfx_fade_step)
+            self._engine.set_volume(new_vol)
+            if new_vol >= self._sfx_fade_target - 0.001:
+                self._sfx_fade_timer.stop()
+                self._engine.set_volume(self._sfx_orig_vol)
+                self._sfx_ducked = False
+
+    def _sfx_on_ended(self):
+        """Chamado quando o SFX terminou naturalmente."""
+        prev = self._sfx_engine.active_idx
+        self._sfx_engine.stop()
+        if prev is not None:
+            self._sfx_refresh_btn(prev)
+        self._sfx_start_fade_in()
+
     def _refresh_search_btn(self):
         has_folder = bool(self._music_folder and Path(self._music_folder).is_dir())
         self._btn_search.setEnabled(has_folder)
@@ -3459,9 +3770,16 @@ class MainWindow(QMainWindow):
             self._search_dlg = MusicSearchDialog(self._music_folder, parent=self)
             self._search_dlg.sig_play.connect(self._play)
             self._search_dlg.sig_add.connect(self._add_search_result)
+            self._search_dlg.sig_sfx.connect(
+                lambda path, idx: self._sfx_set_slot(idx, path))
         # atualiza nomes das playlists (podem ter sido renomeadas)
         all_panels = [p for pg in self._pages for p in pg.get_panels()]
         self._search_dlg.set_playlists([p._name for p in all_panels])
+        sfx_names = [
+            display_name(self._sfx_engine.get_slot(i)) if self._sfx_engine.get_slot(i) else ''
+            for i in range(50)
+        ]
+        self._search_dlg.set_sfx_names(sfx_names)
         self._search_dlg.show()
         self._search_dlg.raise_()
         self._search_dlg.activateWindow()
@@ -3501,6 +3819,7 @@ class MainWindow(QMainWindow):
             },
             'cue_points':  cue_to_save,
             'cue_fadein':  fadein_to_save,
+            'sfx_slots': [self._sfx_engine.get_slot(i) for i in range(50)],
         }
         with open(DATA_FILE, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -3543,6 +3862,13 @@ class MainWindow(QMainWindow):
                 if isinstance(flags, list):
                     normalized_fi = [bool(v) for v in flags]
                     CUE_FADEIN[path] = (normalized_fi + [True]*5)[:5]
+
+            # restaura slots de sonoplastia
+            sfx_data = raw.get('sfx_slots', []) if isinstance(raw, dict) else []
+            for i, path in enumerate(sfx_data[:50]):
+                if path and Path(path).is_file():
+                    self._sfx_engine.set_slot(i, path)
+                    self._sfx_refresh_btn(i)
 
             # restaura layout de grid
             cols = settings.get('grid_cols', 3)
