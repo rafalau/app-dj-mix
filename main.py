@@ -90,8 +90,9 @@ def _flat_icon(kind: str, size: int = 16, color: str = '#ffffff') -> QIcon:
     p.end()
     return QIcon(px)
 
-CUE_POINTS:  dict[str, list] = {}  # path → [frac_or_None] × 5
-CUE_FADEIN:  dict[str, list] = {}  # path → [bool] × 5, True = fade-in ativo
+CUE_POINTS:   dict[str, list] = {}  # path → [frac_or_None] × 5
+CUE_FADEIN:   dict[str, list] = {}  # path → [bool] × 5, True = fade-in ativo
+PLAYED_PATHS: set[str]        = set()  # paths que já foram tocados
 
 
 def _cue_slots(path: str) -> list:
@@ -1505,14 +1506,13 @@ class SongDelegate(QStyledItemDelegate):
     def paint(self, painter, option, index):
         playing = index.data(self.PLAYING_ROLE)
         path = index.data(Qt.ItemDataRole.UserRole)  # SongItem._PATH_ROLE
-        has_cues = bool(path and path in CUE_POINTS and any(v is not None for v in CUE_POINTS[path]))
+        has_cues  = bool(path and path in CUE_POINTS and any(v is not None for v in CUE_POINTS[path]))
         cue_count = sum(1 for v in CUE_POINTS.get(path, []) if v is not None)
+        played    = bool(path and path in PLAYED_PATHS)
 
         if playing:
             painter.save()
-            # Fundo verde-escuro sempre, independente de seleção/foco
             painter.fillRect(option.rect, QColor('#0a2a14'))
-            # Texto verde
             painter.setPen(QColor('#00dd55'))
             font = option.font
             font.setBold(True)
@@ -1524,15 +1524,30 @@ class SongDelegate(QStyledItemDelegate):
                 index.data(Qt.ItemDataRole.DisplayRole) or ''
             )
             painter.restore()
+        elif played:
+            painter.save()
+            selected  = bool(option.state & QStyle.StateFlag.State_Selected)
+            mouseover = bool(option.state & QStyle.StateFlag.State_MouseOver)
+            if selected:
+                bg = QColor('#2a2a4a')
+            elif mouseover:
+                bg = QColor('#222238')
+            else:
+                bg = QColor('#1a1a2a')
+            painter.fillRect(option.rect, bg)
+            painter.setPen(QColor('#7a8aaa') if (selected or mouseover) else QColor('#5a6a8a'))
+            right_pad = 50 if has_cues else 4
+            painter.drawText(
+                option.rect.adjusted(8, 0, -right_pad, 0),
+                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                index.data(Qt.ItemDataRole.DisplayRole) or ''
+            )
+            painter.restore()
         else:
-            # Draw CUE badge padding before default paint so text doesn't overlap
             if has_cues:
                 painter.save()
-                # Draw normal background first
                 super().paint(painter, option, index)
                 painter.restore()
-                # Overdraw text with reduced right margin handled via default paint
-                # (badge drawn below)
             else:
                 super().paint(painter, option, index)
 
@@ -1962,6 +1977,8 @@ class PlaylistPanel(QWidget):
             menu.addSeparator()
             a_rename = menu.addAction('✎  Renomear playlist')
             menu.addSeparator()
+            a_reset_played = menu.addAction('↺  Resetar tocadas desta playlist')
+            menu.addSeparator()
             a_remove = menu.addAction('✕  Remover da lista')
             action = menu.exec(self._list.mapToGlobal(pos))
             if   action == a_play:   self.sig_play.emit(item.path)
@@ -1973,6 +1990,10 @@ class PlaylistPanel(QWidget):
             elif action == a_az:     self._sort_songs(reverse=False)
             elif action == a_za:     self._sort_songs(reverse=True)
             elif action == a_rename: self._rename()
+            elif action == a_reset_played:
+                for p in self._songs:
+                    PLAYED_PATHS.discard(p)
+                self._list.viewport().update()
             elif action == a_remove:
                 self._songs.remove(item.path)
                 self._list.takeItem(self._list.row(item))
@@ -1984,12 +2005,18 @@ class PlaylistPanel(QWidget):
             menu.addSeparator()
             a_az = menu.addAction('↑  Ordenar A → Z')
             a_za = menu.addAction('↓  Ordenar Z → A')
+            menu.addSeparator()
+            a_reset_played2 = menu.addAction('↺  Resetar tocadas desta playlist')
             action = menu.exec(self._list.mapToGlobal(pos))
             if   action == a1:   self._add_files()
             elif action == a2:   self._add_folder()
             elif action == a3:   self._rename()
             elif action == a_az: self._sort_songs(reverse=False)
             elif action == a_za: self._sort_songs(reverse=True)
+            elif action == a_reset_played2:
+                for p in self._songs:
+                    PLAYED_PATHS.discard(p)
+                self._list.viewport().update()
 
     # ── public ────────────────────────────────────────────────────────────
     def add_song(self, path: str):
@@ -2763,7 +2790,8 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle('Configurações')
         self.setModal(True)
-        self.setFixedSize(520, 300)
+        self.setFixedSize(520, 340)
+        self._reset_played = False
         self.setStyleSheet(f"background:{C['bg']};color:{C['text']};")
         _combo_style = f"""
             QComboBox{{
@@ -2850,18 +2878,61 @@ class SettingsDialog(QDialog):
         root.addLayout(form)
         root.addStretch()
 
+        btn_reset_played = QPushButton('↺  Resetar todas as músicas tocadas')
+        btn_reset_played.setFixedHeight(32)
+        btn_reset_played.setStyleSheet(f"""
+            QPushButton{{background:{C['panel']};color:#ff8844;
+                border:1px solid #7a3300;border-radius:5px;font-size:11px;}}
+            QPushButton:hover{{background:#3a1a00;border-color:#ff8844;}}
+        """)
+        btn_reset_played.clicked.connect(self._do_reset_played)
+        root.addWidget(btn_reset_played)
+
+        _btn_style_cancel = f"""
+            QPushButton{{background:{C['panel']};color:{C['text']};
+                border:1px solid {C['border2']};border-radius:5px;
+                font-size:12px;padding:0 18px;}}
+            QPushButton:hover{{background:{C['hover']};border-color:{C['accent_lt']};}}
+        """
+        _btn_style_ok = f"""
+            QPushButton{{background:{C['accent']};color:#000000;
+                border:none;border-radius:5px;
+                font-size:12px;font-weight:bold;padding:0 18px;}}
+            QPushButton:hover{{background:{C['accent_lt']};}}
+        """
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         btn_cancel = QPushButton('Cancelar')
         btn_cancel.setFixedHeight(34)
+        btn_cancel.setStyleSheet(_btn_style_cancel)
         btn_cancel.clicked.connect(self.reject)
         btn_ok = QPushButton('OK')
         btn_ok.setFixedHeight(34)
+        btn_ok.setStyleSheet(_btn_style_ok)
         btn_ok.clicked.connect(self.accept)
         btn_row.addWidget(btn_cancel)
         btn_row.addSpacing(8)
         btn_row.addWidget(btn_ok)
         root.addLayout(btn_row)
+
+    def _do_reset_played(self):
+        msg = QMessageBox(self)
+        msg.setWindowTitle('Resetar tocadas')
+        msg.setText('Limpar o histórico de músicas tocadas em todas as playlists?')
+        msg.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        msg.setDefaultButton(QMessageBox.StandardButton.No)
+        msg.setStyleSheet(f"""
+            QMessageBox{{background:{C['bg']};color:{C['text']};}}
+            QLabel{{color:{C['text']};font-size:13px;}}
+            QPushButton{{background:{C['panel']};color:{C['text']};
+                border:1px solid {C['border2']};border-radius:5px;
+                font-size:12px;padding:5px 18px;min-width:70px;}}
+            QPushButton:hover{{background:{C['hover']};border-color:{C['accent_lt']};}}
+            QPushButton:default{{background:{C['accent']};color:#000;border:none;font-weight:bold;}}
+        """)
+        if msg.exec() == QMessageBox.StandardButton.Yes:
+            self._reset_played = True
 
     def _browse_folder(self):
         folder = QFileDialog.getExistingDirectory(self, 'Selecionar pasta de músicas',
@@ -3475,6 +3546,7 @@ class MainWindow(QMainWindow):
     # ── slots ─────────────────────────────────────────────────────────────
     def _play(self, path: str):
         self._current = path
+        PLAYED_PATHS.add(path)
 
         # Encontra o painel e a linha da música
         self._cur_panel = None
@@ -3573,7 +3645,13 @@ class MainWindow(QMainWindow):
             music_folder=self._music_folder,
             parent=self,
         )
-        if dlg.exec():
+        dlg.exec()
+        if dlg._reset_played:
+            PLAYED_PATHS.clear()
+            for pg in self._pages:
+                for panel in pg.get_panels():
+                    panel._list.viewport().update()
+        if dlg.result() == QDialog.DialogCode.Accepted:
             self._main_device  = dlg.main_device()
             self._cue_device   = dlg.cue_device()
             new_folder         = dlg.music_folder()
@@ -3817,9 +3895,10 @@ class MainWindow(QMainWindow):
                 'grid_cols':    self._grid_cols,
                 'grid_rows':    self._grid_rows,
             },
-            'cue_points':  cue_to_save,
-            'cue_fadein':  fadein_to_save,
-            'sfx_slots': [self._sfx_engine.get_slot(i) for i in range(50)],
+            'cue_points':   cue_to_save,
+            'cue_fadein':   fadein_to_save,
+            'sfx_slots':    [self._sfx_engine.get_slot(i) for i in range(50)],
+            'played_paths': list(PLAYED_PATHS),
         }
         with open(DATA_FILE, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -3869,6 +3948,11 @@ class MainWindow(QMainWindow):
                 if path and Path(path).is_file():
                     self._sfx_engine.set_slot(i, path)
                     self._sfx_refresh_btn(i)
+
+            # restaura histórico de tocadas
+            for path in raw.get('played_paths', []):
+                if isinstance(path, str):
+                    PLAYED_PATHS.add(path)
 
             # restaura layout de grid
             cols = settings.get('grid_cols', 3)
