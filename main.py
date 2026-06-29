@@ -1563,6 +1563,7 @@ class PlaylistPanel(QWidget):
         self._name   = name
         self._color  = color
         self._songs: list[str] = []
+        self._repeat = 0   # 0=off  1=repeat one  2=repeat all
         self.setAcceptDrops(True)
         self._build()
 
@@ -1587,6 +1588,14 @@ class PlaylistPanel(QWidget):
         self._lbl.setToolTip('Duplo clique para renomear')
         hl.addWidget(self._lbl)
         hl.addStretch()
+
+        self._btn_repeat = QPushButton('↻')
+        self._btn_repeat.setFixedSize(26, 20)
+        self._btn_repeat.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._btn_repeat.setToolTip('Repetir: OFF')
+        self._btn_repeat.clicked.connect(self._cycle_repeat)
+        self._apply_repeat_style()
+        hl.addWidget(self._btn_repeat)
 
         for text, tip, fn in [
             ('✎', 'Renomear playlist',  self._rename),
@@ -1798,6 +1807,33 @@ class PlaylistPanel(QWidget):
                 if Path(f).suffix.lower() in AUDIO_EXTENSIONS:
                     self.add_song(os.path.join(root, f))
 
+    def _apply_repeat_style(self):
+        _REPEAT_STYLES = [
+            # off — transparente/dim
+            ("↻",  'Repetir: OFF',
+             "QPushButton{background:rgba(255,255,255,.10);color:rgba(255,255,255,.40);"
+             "border:none;border-radius:3px;font-size:13px;font-weight:bold;}"
+             "QPushButton:hover{background:rgba(255,255,255,.22);color:white;}"),
+            # repeat 1 — azul accent
+            ("↻1", 'Repetir: 1 música',
+             "QPushButton{background:#1464b4;color:white;"
+             "border:none;border-radius:3px;font-size:11px;font-weight:bold;}"
+             "QPushButton:hover{background:#1878d4;}"),
+            # repeat all — verde
+            ("↻∞", 'Repetir: tudo',
+             "QPushButton{background:#1a7a3a;color:white;"
+             "border:none;border-radius:3px;font-size:11px;font-weight:bold;}"
+             "QPushButton:hover{background:#22aa44;}"),
+        ]
+        text, tip, style = _REPEAT_STYLES[self._repeat]
+        self._btn_repeat.setText(text)
+        self._btn_repeat.setToolTip(tip)
+        self._btn_repeat.setStyleSheet(style)
+
+    def _cycle_repeat(self):
+        self._repeat = (self._repeat + 1) % 3
+        self._apply_repeat_style()
+
     def _rename(self):
         from PyQt6.QtWidgets import QInputDialog
         new_name, ok = QInputDialog.getText(
@@ -1876,10 +1912,14 @@ class PlaylistPanel(QWidget):
                 it.setData(SongItem._PLAYING_ROLE, False)
         self.set_active(has_playing)
 
-    def to_dict(self)  -> dict: return {'name': self._name, 'songs': self._songs}
+    def to_dict(self) -> dict:
+        return {'name': self._name, 'songs': self._songs, 'repeat': self._repeat}
+
     def from_dict(self, d: dict):
         self._name = d.get('name', self._name)
         self._lbl.setText(self._name)
+        self._repeat = int(d.get('repeat', 0)) % 3
+        self._apply_repeat_style()
         for p in d.get('songs', []):
             if os.path.exists(p):
                 self.add_song(p)
@@ -3263,12 +3303,27 @@ class MainWindow(QMainWindow):
 
     def _on_ended(self):
         if self._cur_panel is not None and self._cur_row >= 0:
-            row = self._cur_row + 1
-            if row < len(self._cur_panel._songs):
-                self._play(self._cur_panel._songs[row])
-                self._cur_panel._list.setCurrentRow(row)
-                self._cur_panel._list.scrollToItem(self._cur_panel._list.item(row))
+            repeat = self._cur_panel._repeat
+            songs  = self._cur_panel._songs
+
+            if repeat == 1:                        # repeat one
+                self._play(songs[self._cur_row])
+                self._cur_panel._list.setCurrentRow(self._cur_row)
                 return
+
+            next_row = self._cur_row + 1
+            if next_row < len(songs):              # advance normally
+                self._play(songs[next_row])
+                self._cur_panel._list.setCurrentRow(next_row)
+                self._cur_panel._list.scrollToItem(self._cur_panel._list.item(next_row))
+                return
+
+            if repeat == 2 and songs:              # repeat all — volta ao início
+                self._play(songs[0])
+                self._cur_panel._list.setCurrentRow(0)
+                self._cur_panel._list.scrollToItem(self._cur_panel._list.item(0))
+                return
+
         self._current   = None
         self._cur_panel = None
         self._cur_row   = -1
