@@ -146,17 +146,37 @@ def get_duration(path: str) -> str:
 
 
 def display_name(path: str) -> str:
+    import re as _re
+    _GENERIC = {
+        'unknown artist', 'artista desconhecido', 'unknown', 'desconhecido',
+        'various artists', 'vários artistas', 'no artist', 'sem artista',
+    }
+    def _is_generic(s: str) -> bool:
+        if not s:
+            return True
+        sl = s.strip().lower()
+        if sl in _GENERIC:
+            return True
+        # "track 1", "faixa 01", "track01", etc.
+        if _re.fullmatch(r'(track|faixa|pista|titre)\s*\d+', sl):
+            return True
+        return False
+
     name = ''
     if HAS_MUTAGEN:
         try:
             f = MutagenFile(path, easy=True)
             if f:
-                title  = f.get('title',  [''])[0]
-                artist = f.get('artist', [''])[0]
-                if title and artist:
+                title  = (f.get('title',  [''])[0] or '').strip()
+                artist = (f.get('artist', [''])[0] or '').strip()
+                good_title  = title  and not _is_generic(title)
+                good_artist = artist and not _is_generic(artist)
+                if good_title and good_artist:
                     name = f"{artist} — {title}"
-                elif title:
+                elif good_title:
                     name = title
+                elif good_artist:
+                    name = artist
         except Exception:
             pass
     if not name:
@@ -1682,6 +1702,25 @@ class PlaylistPanel(QWidget):
         self._btn_clear.clicked.connect(self._filter_edit.clear)
         shl.addWidget(self._btn_clear)
 
+        _arrow_style = """
+            QPushButton{background:rgba(255,255,255,.08);color:rgba(255,255,255,.5);
+                        border:none;border-radius:3px;font-size:10px;font-weight:bold;}
+            QPushButton:hover{background:rgba(255,255,255,.22);color:white;}
+            QPushButton:disabled{color:rgba(255,255,255,.15);}
+        """
+        shl.addSpacing(4)
+        for arrow, tip, fn in [
+            ('▲', 'Mover para cima',  lambda: self._move_song(-1)),
+            ('▼', 'Mover para baixo', lambda: self._move_song(+1)),
+        ]:
+            b = QPushButton(arrow)
+            b.setFixedSize(18, 18)
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            b.setToolTip(tip)
+            b.setStyleSheet(_arrow_style)
+            b.clicked.connect(fn)
+            shl.addWidget(b)
+
         layout.addWidget(subhdr)
 
         # ── song list ─────────────────────────────────────────────────────
@@ -1852,6 +1891,48 @@ class PlaylistPanel(QWidget):
             self._songs.clear()
             self._upd_count()
 
+    def _move_song(self, delta: int):
+        row = self._list.currentRow()
+        if row < 0:
+            return
+        new_row = max(0, min(row + delta, len(self._songs) - 1))
+        if new_row == row:
+            return
+        self._songs.insert(new_row, self._songs.pop(row))
+        item = self._list.takeItem(row)
+        self._list.insertItem(new_row, item)
+        self._list.setCurrentRow(new_row)
+
+    def _move_to_top(self):
+        row = self._list.currentRow()
+        if row <= 0:
+            return
+        self._songs.insert(0, self._songs.pop(row))
+        item = self._list.takeItem(row)
+        self._list.insertItem(0, item)
+        self._list.setCurrentRow(0)
+
+    def _move_to_bottom(self):
+        row = self._list.currentRow()
+        if row < 0 or row >= len(self._songs) - 1:
+            return
+        self._songs.append(self._songs.pop(row))
+        item = self._list.takeItem(row)
+        self._list.addItem(item)
+        self._list.setCurrentRow(self._list.count() - 1)
+
+    def _sort_songs(self, reverse: bool = False):
+        # ordena pelo nome visível na lista (metadado), não pelo nome do arquivo
+        pairs = []
+        for i in range(self._list.count()):
+            it = self._list.item(i)
+            pairs.append((it.data(SongItem._NAME_ROLE).lower(), it.path))
+        pairs.sort(key=lambda x: x[0], reverse=reverse)
+        self._songs = [p for _, p in pairs]
+        self._list.clear()
+        for path in self._songs:
+            self._list.addItem(SongItem(path))
+
     def _ctx(self, pos):
         item = self._list.itemAt(pos)
         menu = QMenu(self)
@@ -1865,16 +1946,27 @@ class PlaylistPanel(QWidget):
             a_play   = menu.addAction('▶  Reproduzir')
             a_cue    = menu.addAction('🎧  CUE')
             menu.addSeparator()
+            a_top    = menu.addAction('⏫  Mover para o topo')
+            a_up     = menu.addAction('▲  Mover para cima')
+            a_down   = menu.addAction('▼  Mover para baixo')
+            a_bot    = menu.addAction('⏬  Mover para o fim')
+            menu.addSeparator()
+            a_az     = menu.addAction('↑  Ordenar A → Z')
+            a_za     = menu.addAction('↓  Ordenar Z → A')
+            menu.addSeparator()
             a_rename = menu.addAction('✎  Renomear playlist')
             menu.addSeparator()
             a_remove = menu.addAction('✕  Remover da lista')
             action = menu.exec(self._list.mapToGlobal(pos))
-            if action == a_play:
-                self.sig_play.emit(item.path)
-            elif action == a_cue:
-                self.sig_cue.emit(item.path)
-            elif action == a_rename:
-                self._rename()
+            if   action == a_play:   self.sig_play.emit(item.path)
+            elif action == a_cue:    self.sig_cue.emit(item.path)
+            elif action == a_top:    self._move_to_top()
+            elif action == a_up:     self._move_song(-1)
+            elif action == a_down:   self._move_song(+1)
+            elif action == a_bot:    self._move_to_bottom()
+            elif action == a_az:     self._sort_songs(reverse=False)
+            elif action == a_za:     self._sort_songs(reverse=True)
+            elif action == a_rename: self._rename()
             elif action == a_remove:
                 self._songs.remove(item.path)
                 self._list.takeItem(self._list.row(item))
@@ -1883,10 +1975,15 @@ class PlaylistPanel(QWidget):
             a1 = menu.addAction('＋  Adicionar músicas')
             a2 = menu.addAction('⊕  Adicionar pasta')
             a3 = menu.addAction('✎  Renomear playlist')
+            menu.addSeparator()
+            a_az = menu.addAction('↑  Ordenar A → Z')
+            a_za = menu.addAction('↓  Ordenar Z → A')
             action = menu.exec(self._list.mapToGlobal(pos))
-            if action == a1: self._add_files()
-            elif action == a2: self._add_folder()
-            elif action == a3: self._rename()
+            if   action == a1:   self._add_files()
+            elif action == a2:   self._add_folder()
+            elif action == a3:   self._rename()
+            elif action == a_az: self._sort_songs(reverse=False)
+            elif action == a_za: self._sort_songs(reverse=True)
 
     # ── public ────────────────────────────────────────────────────────────
     def add_song(self, path: str):
