@@ -2979,7 +2979,8 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName('DJ Mix Player')
 
-    _fonts_dir = Path(__file__).parent / 'fonts' / 'static'
+    _base = Path(sys._MEIPASS) if hasattr(sys, '_MEIPASS') else Path(__file__).parent
+    _fonts_dir = _base / 'fonts' / 'static'
     for _ttf in _fonts_dir.glob('*.ttf'):
         QFontDatabase.addApplicationFont(str(_ttf))
 
