@@ -18,9 +18,10 @@ from PyQt6.QtWidgets import (
     QLineEdit, QComboBox, QFileDialog, QMessageBox, QMenu,
     QTabWidget, QSizePolicy, QFrame, QScrollArea, QDialog,
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QMimeData, QUrl, QPointF, QRectF
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QMimeData, QUrl, QPointF, QRectF, QSize
 from PyQt6.QtGui import (QPainter, QColor, QLinearGradient, QRadialGradient, QFont,
-                         QDragEnterEvent, QDropEvent, QPolygonF, QFontDatabase)
+                         QDragEnterEvent, QDropEvent, QPolygonF, QFontDatabase,
+                         QPixmap, QIcon, QPen)
 
 # ── Optional backends ─────────────────────────────────────────────────────────
 try:
@@ -52,6 +53,36 @@ except ImportError:
 # ── Constants ─────────────────────────────────────────────────────────────────
 AUDIO_EXTENSIONS = {'.mp3', '.mpa', '.wav', '.flac', '.ogg', '.aac', '.m4a', '.wma', '.opus', '.mp2', '.mp4'}
 FORMATS_FILTER = "Áudio (*.mp3 *.mpa *.wav *.flac *.ogg *.aac *.m4a *.wma *.opus *.mp2 *.mp4);;Todos (*.*)"
+
+
+def _flat_icon(kind: str, size: int = 16, color: str = '#ffffff') -> QIcon:
+    """Gera ícone flat via QPainter. kind: 'lupa' | 'x'"""
+    px = QPixmap(size, size)
+    px.fill(Qt.GlobalColor.transparent)
+    p = QPainter(px)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pen = QPen(QColor(color))
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+
+    if kind == 'lupa':
+        pen.setWidthF(size * 0.12)
+        p.setPen(pen)
+        r = int(size * 0.38)
+        cx, cy = int(size * 0.38), int(size * 0.38)
+        p.drawEllipse(cx - r, cy - r, r * 2, r * 2)
+        hx = int(cx + r * 0.72)
+        hy = int(cy + r * 0.72)
+        p.drawLine(hx, hy, size - 1, size - 1)
+
+    elif kind == 'x':
+        pen.setWidthF(size * 0.14)
+        p.setPen(pen)
+        m = int(size * 0.18)
+        p.drawLine(m, m, size - m, size - m)
+        p.drawLine(size - m, m, m, size - m)
+
+    p.end()
+    return QIcon(px)
 
 CUE_POINTS:  dict[str, list] = {}  # path → [frac_or_None] × 5
 CUE_FADEIN:  dict[str, list] = {}  # path → [bool] × 5, True = fade-in ativo
@@ -872,7 +903,11 @@ class CueWindow(QDialog):
         info_lbl = QLabel('Espaço = play/pause  ·  ← / → = navegar  ·  Shift+← / → = 5s  ·  Clique direito no slot → limpar  ·  Scroll = zoom')
         info_lbl.setStyleSheet(f"color:{C['text_dim']};font-size:10px;")
         bot_row.addWidget(info_lbl, 1)
-        self._btn_clear_all = QPushButton('🗑  LIMPAR TODOS OS CUEs')
+        self._btn_clear_all = QPushButton('  LIMPAR TODOS OS CUEs')
+        _ico_x_gray = _flat_icon('x', 14, '#888888')
+        _ico_x_red  = _flat_icon('x', 14, '#ff6666')
+        self._btn_clear_all.setIcon(_ico_x_gray)
+        self._btn_clear_all.setIconSize(QSize(14, 14))
         self._btn_clear_all.setFixedHeight(28)
         self._btn_clear_all.setStyleSheet(
             f"QPushButton{{background:transparent;color:{C['text_dim']};"
@@ -880,6 +915,15 @@ class CueWindow(QDialog):
             f"font-size:10px;font-weight:bold;padding:0 10px;}}"
             f"QPushButton:hover{{color:#ff6666;border-color:#ff6666;}}"
         )
+        _b = self._btn_clear_all
+        def _btn_enter(e, b=_b, i=_ico_x_red):
+            b.setIcon(i)
+            QPushButton.enterEvent(b, e)
+        def _btn_leave(e, b=_b, i=_ico_x_gray):
+            b.setIcon(i)
+            QPushButton.leaveEvent(b, e)
+        _b.enterEvent = _btn_enter
+        _b.leaveEvent = _btn_leave
         self._btn_clear_all.clicked.connect(self._clear_all_cues)
         bot_row.addWidget(self._btn_clear_all)
         root.addLayout(bot_row)
@@ -1643,6 +1687,8 @@ class PlaylistPanel(QWidget):
         self._list.itemDoubleClicked.connect(lambda i: self.sig_play.emit(i.path))
         self._list.currentItemChanged.connect(
             lambda cur, _: self.sig_focus.emit(cur.path) if cur else None)
+        self._list.itemClicked.connect(
+            lambda item: self.sig_focus.emit(item.path) if item else None)
         self._list.keyPressEvent = self._list_key_press
         layout.addWidget(self._list)
 
@@ -2322,7 +2368,9 @@ class MusicSearchDialog(QDialog):
             f"QPushButton:hover{{background:{C['accent_lt']};}}"
             f"QPushButton:disabled{{background:{C['panel2']};color:{C['text_dim']};}}"
         )
-        self._btn_go = QPushButton('BUSCAR')
+        self._btn_go = QPushButton('  BUSCAR')
+        self._btn_go.setIcon(_flat_icon('lupa', 16, '#ffffff'))
+        self._btn_go.setIconSize(QSize(16, 16))
         self._btn_go.setFixedHeight(36)
         self._btn_go.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._btn_go.setEnabled(False)
@@ -2776,7 +2824,9 @@ class MainWindow(QMainWindow):
         tbl.addSpacing(12)
 
         # Buscar música button
-        self._btn_search = QPushButton('🔍  BUSCAR MÚSICA')
+        self._btn_search = QPushButton('  BUSCAR MÚSICA')
+        self._btn_search.setIcon(_flat_icon('lupa', 15, '#cccccc'))
+        self._btn_search.setIconSize(QSize(15, 15))
         self._btn_search.setFixedHeight(34)
         self._btn_search.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._btn_search.setEnabled(False)   # habilitado só quando pasta configurada
