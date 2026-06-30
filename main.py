@@ -312,6 +312,7 @@ class AudioEngine(QObject):
     sig_dur     = pyqtSignal(int)
     sig_vu      = pyqtSignal(float, float)
     sig_ended   = pyqtSignal()
+    sig_loaded  = pyqtSignal(bool)   # True = carregou OK, False = erro
 
     def __init__(self):
         super().__init__()
@@ -329,7 +330,9 @@ class AudioEngine(QObject):
         self._vu_l       = 0.0
         self._vu_r       = 0.0
 
-        self._pw_node       = None   # PipeWire node.name para roteamento
+        self._pw_node    = None    # PipeWire node.name para roteamento
+        self._load_gen   = 0       # geração do load atual (cancela loads antigos)
+        self._fade_frames = 0      # frames restantes de fade-in no callback
 
         self._tick_timer = QTimer()
         self._tick_timer.setInterval(40)
@@ -361,8 +364,19 @@ class AudioEngine(QObject):
             else:
                 self.sig_state.emit('paused')
 
-    def load(self, path: str) -> bool:
+    def load(self, path: str, autoplay: bool = False):
+        """Carrega arquivo em background thread. Emite sig_loaded(bool) ao concluir."""
         self.stop()
+        self._load_gen += 1
+        gen = self._load_gen
+        t = threading.Thread(
+            target=self._load_worker,
+            args=(path, gen, autoplay),
+            daemon=True,
+        )
+        t.start()
+
+    def _load_worker(self, path: str, gen: int, autoplay: bool):
         data, sr = None, 44100
         if HAS_SF:
             try:
@@ -381,18 +395,26 @@ class AudioEngine(QObject):
                 sr   = pygame.mixer.get_init()[0] or 44100
             except Exception as e:
                 print(f"AudioEngine fallback load error: {e}")
+        # se um load mais novo foi disparado, descarta este
+        if gen != self._load_gen:
+            return
         if data is None:
             self.sig_state.emit('stopped')
-            raise RuntimeError(f"Não foi possível carregar: {path}")
-        self._data          = data
-        self._samplerate    = int(sr)
-        self._channels      = data.shape[1] if data.ndim > 1 else 1
-        self._path          = path
-        self._duration      = int(len(data) / self._samplerate)
+            self.sig_loaded.emit(False)
+            return
+        self._data       = data
+        self._samplerate = int(sr)
+        self._channels   = data.shape[1] if data.ndim > 1 else 1
+        self._path       = path
+        self._duration   = int(len(data) / self._samplerate)
         with self._lock:
             self._cursor = 0
         self.sig_dur.emit(self._duration)
-        return True
+        self.sig_loaded.emit(True)
+        if autoplay:
+            self._start_stream()
+            self._state = 'playing'
+            self.sig_state.emit('playing')
 
     def play(self):
         if self._data is None:
@@ -456,6 +478,8 @@ class AudioEngine(QObject):
         self._close_stream()
         if not HAS_SD or self._data is None:
             return
+        # fade-in de ~10 ms para eliminar estalo ao iniciar stream
+        self._fade_frames = max(1, self._samplerate // 100)
         kwargs = dict(
             samplerate=self._samplerate,
             channels=self._channels,
@@ -507,6 +531,13 @@ class AudioEngine(QObject):
             outdata[n:] = 0
         else:
             outdata[:] = chunk * self._volume
+        # fade-in nos primeiros frames para evitar estalo ao iniciar
+        if self._fade_frames > 0:
+            import numpy as np
+            fade_n = min(self._fade_frames, frames)
+            ramp = np.linspace(0.0, 1.0, fade_n, dtype='float32').reshape(-1, 1)
+            outdata[:fade_n] *= ramp
+            self._fade_frames -= fade_n
 
     def _on_finished(self):
         if self._state == 'playing':
@@ -549,10 +580,11 @@ class AudioEngine(QObject):
 
 # ── CUE Engine ────────────────────────────────────────────────────────────────
 class CueEngine(QObject):
-    sig_pos   = pyqtSignal(float)   # 0.0–1.0
-    sig_state = pyqtSignal(str)     # playing / paused / stopped
-    sig_ended = pyqtSignal()
-    sig_dur   = pyqtSignal(int)     # seconds
+    sig_pos    = pyqtSignal(float)   # 0.0–1.0
+    sig_state  = pyqtSignal(str)     # playing / paused / stopped
+    sig_ended  = pyqtSignal()
+    sig_dur    = pyqtSignal(int)     # seconds
+    sig_loaded = pyqtSignal(bool)    # True = carregou OK
 
     def __init__(self):
         super().__init__()
@@ -568,6 +600,8 @@ class CueEngine(QObject):
         self._stream    = None
         self._device    = None   # None = default
         self._pw_node   = None
+        self._load_gen  = 0
+        self._fade_frames = 0
 
         self._pos_timer = QTimer()
         self._pos_timer.setInterval(50)
@@ -587,16 +621,25 @@ class CueEngine(QObject):
             self._device  = next((idx for n, idx in pairs if n == name), None)
             self._pw_node = _PW_NODE_MAP.get(name)
 
-    def load(self, path: str) -> bool:
+    def load(self, path: str, autoplay: bool = False):
+        """Carrega arquivo em background thread. Emite sig_loaded(bool) ao concluir."""
         self.stop()
+        self._load_gen += 1
+        gen = self._load_gen
+        t = threading.Thread(
+            target=self._load_worker,
+            args=(path, gen, autoplay),
+            daemon=True,
+        )
+        t.start()
+
+    def _load_worker(self, path: str, gen: int, autoplay: bool):
         data, sr = None, 44100
-        # primary: soundfile
         if HAS_SF:
             try:
                 data, sr = sf.read(path, dtype='float32', always_2d=True)
             except Exception:
                 pass
-        # fallback: pygame sndarray (handles MP3 on Windows)
         if data is None and HAS_PYGAME:
             try:
                 import numpy as np
@@ -609,18 +652,25 @@ class CueEngine(QObject):
                 sr   = pygame.mixer.get_init()[0] or 44100
             except Exception as e2:
                 print(f"CueEngine: não foi possível carregar audio: {e2}")
+        if gen != self._load_gen:
+            return
         if data is None:
-            return False
-        self._data          = data
-        self._samplerate    = int(sr)
-        self._channels      = data.shape[1] if data.ndim > 1 else 1
-        self._path          = path
-        self._duration      = int(len(data) / self._samplerate)
+            self.sig_loaded.emit(False)
+            return
+        self._data       = data
+        self._samplerate = int(sr)
+        self._channels   = data.shape[1] if data.ndim > 1 else 1
+        self._path       = path
+        self._duration   = int(len(data) / self._samplerate)
         with self._lock:
             self._cursor = 0
         self.sig_dur.emit(self._duration)
         self.sig_state.emit('stopped')
-        return True
+        self.sig_loaded.emit(True)
+        if autoplay:
+            self._start_stream()
+            self._state = 'playing'
+            self.sig_state.emit('playing')
 
     def play(self):
         if not HAS_SF:
@@ -692,6 +742,7 @@ class CueEngine(QObject):
         self._close_stream()
         if not HAS_SD or self._data is None:
             return
+        self._fade_frames = max(1, self._samplerate // 100)
         kwargs = dict(
             samplerate=self._samplerate,
             channels=self._channels,
@@ -737,6 +788,12 @@ class CueEngine(QObject):
             outdata[n:]  = 0
         else:
             outdata[:] = chunk * self._volume
+        if self._fade_frames > 0:
+            import numpy as np
+            fade_n = min(self._fade_frames, frames)
+            ramp = np.linspace(0.0, 1.0, fade_n, dtype='float32').reshape(-1, 1)
+            outdata[:fade_n] *= ramp
+            self._fade_frames -= fade_n
 
     def _on_finished(self):
         if self._state == 'playing':
@@ -4011,11 +4068,12 @@ class MainWindow(QMainWindow):
     # ── signal wiring ─────────────────────────────────────────────────────
     def _wire(self):
         e = self._engine
-        e.sig_pos  .connect(self._on_pos)
-        e.sig_state.connect(self._transport.set_state)
-        e.sig_dur  .connect(self._transport.set_duration)
-        e.sig_vu   .connect(self._on_vu)
-        e.sig_ended.connect(self._on_ended)
+        e.sig_pos   .connect(self._on_pos)
+        e.sig_state .connect(self._transport.set_state)
+        e.sig_dur   .connect(self._transport.set_duration)
+        e.sig_vu    .connect(self._on_vu)
+        e.sig_ended .connect(self._on_ended)
+        e.sig_loaded.connect(self._on_load_result)
 
         t = self._transport
         t.sig_play  .connect(e.play)
@@ -4094,7 +4152,6 @@ class MainWindow(QMainWindow):
                 """)
 
     def _on_cue_btn(self, idx: int):
-        # Use focused song if available, fallback to current playing
         path = self._focused or self._current
         if not path:
             return
@@ -4102,24 +4159,27 @@ class MainWindow(QMainWindow):
         frac = slots[idx]
         if frac is None:
             return
-        # Load song if it's not the one currently in the engine
         if path != self._current:
+            # precisa carregar outra música — ação de CUE executada em _on_load_result
             self._engine.stop()
-            try:
-                self._engine.load(path)
-            except RuntimeError:
-                return
-            self._current = path
+            self._current      = path
+            self._pending_path = path
+            self._pending_cue  = lambda: self._apply_cue(path, idx, frac)
             name = display_name(path)
             self._transport.set_song(name)
             for pg in self._pages:
                 pg.set_playing(path)
-        use_fade = _cue_fadein(path)[idx]
+            self._engine.load(path, autoplay=False)
+            self._refresh_cue_buttons()
+            return
+        self._apply_cue(path, idx, frac)
+
+    def _apply_cue(self, path: str, idx: int, frac: float):
+        use_fade    = _cue_fadein(path)[idx]
         was_playing = self._engine.state == 'playing'
         if use_fade:
-            # Se já há um fade em andamento, usa o target dele (não o volume mid-fade)
             fade_active = hasattr(self, '_fade_timer') and self._fade_timer.isActive()
-            target_vol = self._fade_target if fade_active else self._engine._volume
+            target_vol  = self._fade_target if fade_active else self._engine._volume
             if fade_active:
                 self._fade_timer.stop()
             self._engine.set_volume(0.0)
@@ -4250,7 +4310,9 @@ class MainWindow(QMainWindow):
 
     # ── slots ─────────────────────────────────────────────────────────────
     def _play(self, path: str):
-        self._current = path
+        self._current       = path
+        self._pending_path  = path   # guardado para _on_load_result
+        self._pending_cue   = None   # sem ação de CUE pendente
         PLAYED_PATHS.add(path)
 
         # Encontra o painel e a linha da música
@@ -4265,23 +4327,31 @@ class MainWindow(QMainWindow):
             if self._cur_panel:
                 break
 
-        self._engine.stop()
-        try:
-            self._engine.load(path)
-        except RuntimeError as e:
-            ext = Path(path).suffix.upper()
-            QMessageBox.warning(
-                self, 'Formato não suportado',
-                f'Não foi possível carregar o arquivo:\n{Path(path).name}\n\n'
-                f'Formato {ext} não é suportado pelo backend de áudio.\n\n{e}'
-            )
-            return
-        self._engine.play()
+        # UI responde imediatamente; áudio começa assim que o load terminar
         name = display_name(path)
         self._transport.set_song(name)
         for pg in self._pages:
             pg.set_playing(path)
         self._refresh_cue_buttons()
+
+        self._engine.stop()
+        self._engine.load(path, autoplay=True)
+
+    def _on_load_result(self, success: bool):
+        if not success:
+            path = getattr(self, '_pending_path', None)
+            ext  = Path(path).suffix.upper() if path else ''
+            QMessageBox.warning(
+                self, 'Formato não suportado',
+                f'Não foi possível carregar o arquivo:\n{Path(path).name if path else ""}\n\n'
+                f'Formato {ext} não é suportado pelo backend de áudio.'
+            )
+            return
+        # executa ação de CUE pendente (quando _on_cue_btn carregou nova música)
+        cb = getattr(self, '_pending_cue', None)
+        if cb:
+            self._pending_cue = None
+            cb()
 
     def _stop(self):
         self._engine.stop()
