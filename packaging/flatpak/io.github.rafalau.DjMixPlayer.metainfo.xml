@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.rafalau.DjMixPlayer</id>
+  <name>DJ Mix Player</name>
+  <summary>Player de músicas para DJs com múltiplas saídas de áudio</summary>
+  <description>
+    <p>
+      DJ Mix Player é um player profissional para DJs, com suporte a múltiplas
+      saídas de áudio simultâneas, pontos de CUE, waveform visual, fade automático
+      e controle de volume independente por deck.
+    </p>
+  </description>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <url type="homepage">https://github.com/rafalau/app-dj-mix</url>
+  <releases>
+    <release version="1.0.4" date="2026-06-30"/>
+  </releases>
+  <categories>
+    <category>Audio</category>
+    <category>Music</category>
+  </categories>
+  <content_rating type="oars-1.1"/>
+</component>
