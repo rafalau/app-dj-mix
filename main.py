@@ -3653,19 +3653,11 @@ class MainWindow(QMainWindow):
                     }}
                 """)
 
-    @staticmethod
-    def _panel_seq(d: dict) -> int:
-        """Extrai número sequencial do nome 'PLAYLIST N'."""
-        import re
-        m = re.search(r'(\d+)', d.get('name', ''))
-        return int(m.group(1)) if m else 999999
-
-    def _all_panels_sorted(self) -> list[dict]:
-        """Coleta todos os painéis de todas as páginas, ordenados sequencialmente."""
+    def _all_panels(self) -> list[dict]:
+        """Coleta todos os painéis de todas as páginas em ordem sequencial."""
         panels = []
         for page in self._pages:
             panels.extend(page.to_dict())
-        panels.sort(key=self._panel_seq)
         return panels
 
     def _distribute_panels(self, all_panels: list[dict]):
@@ -3683,8 +3675,8 @@ class MainWindow(QMainWindow):
         if cols == self._grid_cols and rows == self._grid_rows:
             return
 
-        # coleta todos os painéis em ordem sequencial correta
-        all_panels = self._all_panels_sorted()
+        # coleta todos os painéis em ordem sequencial (posição atual nas páginas)
+        all_panels = self._all_panels()
 
         cur_idx = self._stack.currentIndex()
 
@@ -4148,10 +4140,9 @@ class MainWindow(QMainWindow):
                 self._stack.setCurrentIndex(0)
                 self._update_tab_btns(0)
 
-            # carrega playlists e normaliza a ordem sequencial
+            # carrega playlists nas páginas já com o layout correto
             for i, pd in enumerate(playlists[:len(self._pages)]):
                 self._pages[i].from_dict(pd)
-            self._distribute_panels(self._all_panels_sorted())
 
         except Exception as e:
             print(f"load data: {e}")
