@@ -5,7 +5,7 @@
 #define MyAppName      "DJ Mix Player"
 #define MyAppVersion   "1.0.0"
 #define MyAppPublisher "Rafael Lauriano"
-#define MyAppURL       "https://github.com/rafalau/djmixplayer"
+#define MyAppURL       "https://github.com/rafalau/app-dj-mix"
 #define MyAppExeName   "DJMixPlayer.exe"
 #define MyDistDir      "..\dist\DJMixPlayer"
 

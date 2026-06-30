@@ -8,7 +8,7 @@ Player de playlists para DJs com múltiplos painéis, sonoplastia, VU meters, CU
 
 ## Download
 
-👉 **[Baixar instalador Windows](https://github.com/rafalau/djmixplayer/releases/latest)**
+👉 **[Baixar instalador Windows](https://github.com/rafalau/app-dj-mix/releases/latest)**
 
 Baixe `DJMixPlayer_Setup_vX.X.X.exe`, execute e pronto — não precisa instalar Python.
 
@@ -98,7 +98,7 @@ app-dj-mix/
 2. Atualize `version.py` com seu usuário GitHub se necessário
 3. Push do código:
    ```bash
-   git remote add origin https://github.com/rafalau/djmixplayer.git
+   git remote add origin https://github.com/rafalau/app-dj-mix.git
    git push -u origin main
    ```
 4. Para publicar a v1.0.0:
