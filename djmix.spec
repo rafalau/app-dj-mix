@@ -8,7 +8,10 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[
-        ('fonts', 'fonts'),
+        ('fonts',       'fonts'),
+        ('assets',      'assets'),
+        ('version.py',  '.'),
+        ('updater.py',  '.'),
     ],
     hiddenimports=[
         'sounddevice',
@@ -24,6 +27,9 @@ a = Analysis(
         'mutagen.mp4',
         'mutagen.ogg',
         'mutagen.wave',
+        'urllib.request',
+        'version',
+        'updater',
     ],
     hookspath=[],
     hooksconfig={},
@@ -47,13 +53,14 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    console=False,          # sem janela de console
+    console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    # icon='icon.ico',      # descomente e coloque um .ico quando tiver
+    icon='assets/icon.ico',
+    version='assets/version_info.txt',
 )
 
 coll = COLLECT(

@@ -10,7 +10,17 @@ import math
 import time
 import random
 import threading
+import urllib.request
 from pathlib import Path
+
+try:
+    from version import APP_VERSION, APP_NAME, GITHUB_REPO, APP_URL
+    from updater import check_for_update
+    HAS_UPDATER = True
+except Exception:
+    APP_VERSION = '1.0.0'
+    APP_NAME    = 'DJ Mix Player'
+    HAS_UPDATER = False
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -93,6 +103,7 @@ def _flat_icon(kind: str, size: int = 16, color: str = '#ffffff') -> QIcon:
 CUE_POINTS:   dict[str, list] = {}  # path → [frac_or_None] × 5
 CUE_FADEIN:   dict[str, list] = {}  # path → [bool] × 5, True = fade-in ativo
 PLAYED_PATHS: set[str]        = set()  # paths que já foram tocados
+_MUSIC_FOLDER: str            = ''   # pasta padrão para diálogos de arquivo
 
 
 def _cue_slots(path: str) -> list:
@@ -1852,12 +1863,12 @@ class PlaylistPanel(QWidget):
 
     # ── actions ───────────────────────────────────────────────────────────
     def _add_files(self):
-        paths, _ = QFileDialog.getOpenFileNames(self, 'Adicionar músicas', '', FORMATS_FILTER)
+        paths, _ = QFileDialog.getOpenFileNames(self, 'Adicionar músicas', _MUSIC_FOLDER or str(Path.home()), FORMATS_FILTER)
         for p in paths:
             self.add_song(p)
 
     def _add_folder(self):
-        d = QFileDialog.getExistingDirectory(self, 'Selecionar pasta')
+        d = QFileDialog.getExistingDirectory(self, 'Selecionar pasta', _MUSIC_FOLDER or str(Path.home()))
         if d:
             self._add_dir(d)
 
@@ -3303,8 +3314,11 @@ class SettingsDialog(QDialog):
 
 # ── Main Window ───────────────────────────────────────────────────────────────
 class MainWindow(QMainWindow):
+    _sig_update = pyqtSignal(str, str, str)   # tag, dl_url, body
+
     def __init__(self):
         super().__init__()
+        self._sig_update.connect(self._show_update_dialog)
         self._engine        = AudioEngine()
         self._cue_engine    = CueEngine()
         self._current: str | None = None
@@ -3336,10 +3350,39 @@ class MainWindow(QMainWindow):
         self._cue_window = CueWindow(self._cue_engine, self)
         self._wire()
         self._load()
-        self.setWindowTitle('DJ Mix Player')
+        self.setWindowTitle(f'DJ Mix Player  v{APP_VERSION}')
         self.resize(1280, 820)
         self.setMinimumSize(900, 600)
         QTimer.singleShot(300, self._refresh_panel_styles)
+        if HAS_UPDATER:
+            QTimer.singleShot(4000, self._check_update)
+
+    # ── Auto-update ──────────────────────────────────────────────────────
+    def _check_update(self):
+        if HAS_UPDATER:
+            check_for_update(
+                on_update_found=lambda tag, url, body: self._sig_update.emit(tag, url, body)
+            )
+
+    def _show_update_dialog(self, tag: str, dl_url: str, body: str):
+        from PyQt6.QtWidgets import QMessageBox
+        msg = QMessageBox(self)
+        msg.setWindowTitle('Atualização disponível')
+        msg.setText(
+            f'<b>DJ Mix Player v{tag}</b> está disponível!<br>'
+            f'Sua versão: v{APP_VERSION}<br><br>'
+            f'Deseja abrir a página de download?'
+        )
+        if body:
+            msg.setDetailedText(body)
+        msg.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        msg.setDefaultButton(QMessageBox.StandardButton.Yes)
+        msg.setStyleSheet(f"background:{C['panel']};color:{C['text']};")
+        if msg.exec() == QMessageBox.StandardButton.Yes:
+            import webbrowser
+            webbrowser.open(dl_url)
 
     # ── UI construction ───────────────────────────────────────────────────
     def _build(self):
@@ -4039,9 +4082,11 @@ class MainWindow(QMainWindow):
                 except Exception as e: print(f"reset/sfx_btn: {e}")
 
             # Reseta configurações
+            global _MUSIC_FOLDER
             self._main_device  = ''
             self._cue_device   = ''
             self._music_folder = ''
+            _MUSIC_FOLDER      = ''
             try: self._refresh_search_btn()
             except Exception as e: print(f"reset/search_btn: {e}")
 
@@ -4090,7 +4135,9 @@ class MainWindow(QMainWindow):
             new_folder         = dlg.music_folder()
             self._cue_engine.set_device(self._cue_device)
             if new_folder != self._music_folder:
+                global _MUSIC_FOLDER
                 self._music_folder = new_folder
+                _MUSIC_FOLDER      = new_folder
                 self._refresh_search_btn()
                 if self._search_dlg:
                     self._search_dlg.set_folder(new_folder)
@@ -4175,7 +4222,7 @@ class MainWindow(QMainWindow):
         if action == a_set:
             path, _ = QFileDialog.getOpenFileName(
                 self, f'Escolher som para slot {slot_lbl}',
-                '', FORMATS_FILTER)
+                self._music_folder or str(Path.home()), FORMATS_FILTER)
             if path:
                 self._sfx_set_slot(abs_idx, path)
         elif action == a_clear:
@@ -4358,6 +4405,8 @@ class MainWindow(QMainWindow):
             self._main_device  = settings.get('main_device', '')
             self._cue_device   = settings.get('cue_device', '')
             self._music_folder = settings.get('music_folder', '')
+            global _MUSIC_FOLDER
+            _MUSIC_FOLDER      = self._music_folder
             if self._cue_device:
                 self._cue_engine.set_device(self._cue_device)
             self._refresh_search_btn()
