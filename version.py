@@ -1,5 +1,5 @@
 APP_NAME      = "DJ Mix Player"
-APP_VERSION   = "1.0.0"
+APP_VERSION   = "1.0.1"
 APP_AUTHOR    = "Rafael Lauriano"
 APP_URL       = "https://github.com/rafalau/app-dj-mix"
 GITHUB_REPO   = "rafalau/app-dj-mix"

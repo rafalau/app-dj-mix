@@ -38,7 +38,7 @@ if not exist %ISCC% (
     echo.
     echo ============================================
     echo   INSTALADOR GERADO:
-    echo   dist\installer\DJMixPlayer_Setup_v1.0.0.exe
+    echo   dist\installer\DJMixPlayer_Setup_v1.0.1.exe
     echo ============================================
 )
 
