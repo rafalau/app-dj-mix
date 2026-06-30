@@ -89,8 +89,9 @@ def _load_backends():
                                 if _count[_desc] > 1 else _desc)
                     _pa_sinks_early.append((_display, _sink.name))
                     _PW_NODE_MAP[_display] = _sink.name
-        except Exception:
-            pass
+            print(f'[djmix] pulsectl OK: {len(_pa_sinks_early)} sinks: {[n for n,_ in _pa_sinks_early]}', flush=True)
+        except Exception as _e:
+            print(f'[djmix] pulsectl ERRO: {_e}', flush=True)
     try:
         import sounddevice as _sd
         sd    = _sd
