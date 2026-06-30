@@ -2043,7 +2043,7 @@ class PlaylistPanel(QWidget):
         self.set_active(has_playing)
 
     def to_dict(self) -> dict:
-        return {'name': self._name, 'songs': self._songs, 'repeat': self._repeat}
+        return {'name': self._name, 'songs': list(self._songs), 'repeat': self._repeat}
 
     def from_dict(self, d: dict):
         self._name = d.get('name', self._name)
@@ -2784,6 +2784,152 @@ class MusicSearchDialog(QDialog):
         self._on_item_activated(self._list.currentItem())
 
 
+class LayoutPickerBtn(QPushButton):
+    """Miniatura de layout: canvas escuro + células sólidas + legenda."""
+    BW, BH  = 116, 94   # tamanho total do botão
+    PAD     = 10         # margem interna
+    GAP     = 3          # espaço entre células
+    LBL_H   = 20         # altura da legenda na base
+
+    def __init__(self, cols: int, rows: int, parent=None):
+        super().__init__(parent)
+        self._cols = cols
+        self._rows = rows
+        self.setCheckable(True)
+        self.setFixedSize(self.BW, self.BH)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._apply_style()
+
+    def _apply_style(self):
+        checked = self.isChecked()
+        border  = f"2px solid {C['accent']}" if checked else f"1px solid {C['border2']}"
+        bg      = '#0c1e14' if checked else C['panel']
+        hover   = '' if checked else (
+            f"QPushButton:hover {{ background: {C['hover']};"
+            f" border: 1px solid {C['accent_lt']}; }}")
+        self.setStyleSheet(
+            f"QPushButton {{ background:{bg}; border:{border};"
+            f" border-radius:10px; }}" + hover)
+
+    def setChecked(self, v):
+        super().setChecked(v)
+        self._apply_style()
+
+    def paintEvent(self, ev):
+        super().paintEvent(ev)
+
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        checked = self.isChecked()
+
+        # ── canvas da grade ────────────────────────────────────────────
+        cx = self.PAD
+        cy = self.PAD
+        cw = self.BW - self.PAD * 2
+        ch = self.BH - self.PAD * 2 - self.LBL_H
+
+        # fundo do canvas
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor('#0e1720'))
+        p.drawRoundedRect(cx, cy, cw, ch, 5, 5)
+
+        # células
+        cell_color = QColor('#00cc55') if checked else QColor('#2e4860')
+        cell_w = cw / self._cols
+        cell_h = ch / self._rows
+
+        p.setBrush(cell_color)
+        for r in range(self._rows):
+            for c in range(self._cols):
+                x = cx + int(c * cell_w) + self.GAP
+                y = cy + int(r * cell_h) + self.GAP
+                w = max(1, int(cell_w) - self.GAP * 2)
+                h = max(1, int(cell_h) - self.GAP * 2)
+                p.drawRoundedRect(x, y, w, h, 2, 2)
+
+        # ── legenda ────────────────────────────────────────────────────
+        lbl_y = self.BH - self.LBL_H
+        p.setPen(QColor(C['accent'] if checked else C['text_dim']))
+        font = QFont('Roboto', 9, QFont.Weight.Bold if checked else QFont.Weight.Normal)
+        p.setFont(font)
+        p.drawText(0, lbl_y, self.BW, self.LBL_H,
+                   Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                   f'{self._cols} × {self._rows}')
+        p.end()
+
+
+class LayoutDialog(QDialog):
+    GROUPS = [
+        ('1 LINHA',  [(2, 1), (3, 1), (4, 1)]),
+        ('2 LINHAS', [(2, 2), (3, 2), (4, 2)]),
+        ('3 LINHAS', [(3, 3), (4, 3)]),
+    ]
+
+    def __init__(self, current_cols: int, current_rows: int, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('Layout das Playlists')
+        self.setModal(True)
+        self.setFixedSize(580, 530)
+        self.setStyleSheet(f"background:{C['bg']};color:{C['text']};")
+        self._cols = current_cols
+        self._rows = current_rows
+        self._btns: list[LayoutPickerBtn] = []
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(30, 26, 30, 26)
+        root.setSpacing(0)
+
+        # título
+        title = QLabel('LAYOUT DAS PLAYLISTS')
+        title.setStyleSheet(
+            f"color:{C['accent_lt']};font-size:13px;"
+            f"font-weight:bold;letter-spacing:3px;")
+        root.addWidget(title)
+        root.addSpacing(10)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setFixedHeight(1)
+        sep.setStyleSheet(f"background:{C['border2']};border:none;")
+        root.addWidget(sep)
+        root.addSpacing(20)
+
+        for group_label, layouts in self.GROUPS:
+            lbl = QLabel(group_label)
+            lbl.setStyleSheet(
+                f"color:{C['text_dim']};font-size:9px;"
+                f"font-weight:bold;letter-spacing:2px;")
+            root.addWidget(lbl)
+            root.addSpacing(10)
+
+            row_box = QHBoxLayout()
+            row_box.setSpacing(14)
+            row_box.setContentsMargins(0, 0, 0, 0)
+            for cols, rows in layouts:
+                btn = LayoutPickerBtn(cols, rows, self)
+                btn.setChecked(cols == current_cols and rows == current_rows)
+                btn.clicked.connect(lambda _, c=cols, r=rows: self._pick(c, r))
+                self._btns.append(btn)
+                row_box.addWidget(btn)
+            row_box.addStretch()
+            root.addLayout(row_box)
+            root.addSpacing(24)
+
+        root.addStretch()
+
+    def _pick(self, cols: int, rows: int):
+        self._cols = cols
+        self._rows = rows
+        for btn in self._btns:
+            btn.setChecked(btn._cols == cols and btn._rows == rows)
+            btn.update()
+        self.accept()
+
+    def chosen(self) -> tuple[int, int]:
+        return self._cols, self._rows
+
+
 class SettingsDialog(QDialog):
     def __init__(self, devices: list, main_device: str, cue_device: str,
                  music_folder: str = '', parent=None):
@@ -3202,28 +3348,19 @@ class MainWindow(QMainWindow):
 
         sl.addStretch()
 
-        # Botões de seleção de layout
-        lyt_lbl = QLabel('LAYOUT')
-        lyt_lbl.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-        lyt_lbl.setStyleSheet(f"color:{C['text_dim']};font-size:8px;font-weight:bold;letter-spacing:1px;")
-        sl.addWidget(lyt_lbl)
-
-        self._layout_btns: list[QPushButton] = []
-        for label, cols, rows in [('3×3', 3, 3), ('4×3', 4, 3)]:
-            b = QPushButton(label)
-            b.setFixedSize(36, 24)
-            b.setCheckable(True)
-            b.setChecked(cols == 3)
-            b.clicked.connect(lambda _, c=cols, r=rows: self._set_grid_layout(c, r))
-            b.setStyleSheet(f"""
-                QPushButton{{background:{C['panel']};color:{C['text_dim']};
-                    border:1px solid {C['border2']};border-radius:4px;
-                    font-size:10px;font-weight:bold;}}
-                QPushButton:checked{{background:{C['accent']};color:white;border:none;}}
-                QPushButton:hover:!checked{{background:{C['hover']};color:{C['text']};}}
-            """)
-            self._layout_btns.append(b)
-            sl.addWidget(b)
+        # Botão único de layout
+        self._btn_layout = QPushButton('LAYOUT')
+        self._btn_layout.setFixedSize(52, 28)
+        self._btn_layout.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._btn_layout.setStyleSheet(f"""
+            QPushButton{{background:{C['panel']};color:{C['text_dim']};
+                border:1px solid {C['border2']};border-radius:4px;
+                font-size:8px;font-weight:bold;letter-spacing:1px;}}
+            QPushButton:hover{{background:{C['hover']};color:{C['text']};
+                border-color:{C['accent_lt']};}}
+        """)
+        self._btn_layout.clicked.connect(self._open_layout_dialog)
+        sl.addWidget(self._btn_layout)
 
         self._update_tab_btns(0)
         cl.addWidget(sidebar)
@@ -3512,8 +3649,12 @@ class MainWindow(QMainWindow):
     def _set_grid_layout(self, cols: int, rows: int):
         if cols == self._grid_cols and rows == self._grid_rows:
             return
-        # salva dados atuais
-        saved = [p.to_dict() for p in self._pages]
+
+        # coleta TODOS os painéis em ordem linear (refluxo)
+        all_panels: list[dict] = []
+        for page in self._pages:
+            all_panels.extend(page.to_dict())
+
         cur_idx = self._stack.currentIndex()
 
         # remove páginas antigas
@@ -3524,8 +3665,9 @@ class MainWindow(QMainWindow):
 
         self._grid_cols = cols
         self._grid_rows = rows
+        per_page = cols * rows
 
-        # recria páginas com novo layout
+        # recria páginas e distribui painéis em ordem
         for i in range(8):
             page = TabPage(i, cols, rows)
             page.sig_play.connect(self._play)
@@ -3533,15 +3675,18 @@ class MainWindow(QMainWindow):
             page.sig_focus.connect(self._on_focus)
             self._pages.append(page)
             self._stack.addWidget(page)
-            if i < len(saved):
-                page.from_dict(saved[i])
+            slice_ = all_panels[i * per_page : (i + 1) * per_page]
+            if slice_:
+                page.from_dict(slice_)
 
         self._stack.setCurrentIndex(cur_idx)
         self._update_tab_btns(cur_idx)
 
-        # atualiza aparência dos botões de layout
-        for b in self._layout_btns:
-            b.setChecked(b.text() == f'{cols}×{rows}')
+    def _open_layout_dialog(self):
+        dlg = LayoutDialog(self._grid_cols, self._grid_rows, parent=self)
+        if dlg.exec():
+            cols, rows = dlg.chosen()
+            self._set_grid_layout(cols, rows)
 
     # ── slots ─────────────────────────────────────────────────────────────
     def _play(self, path: str):
@@ -3917,9 +4062,6 @@ class MainWindow(QMainWindow):
                 playlists = raw.get('playlists', [])
                 settings  = raw.get('settings', {})
 
-            for i, pd in enumerate(playlists[:len(self._pages)]):
-                self._pages[i].from_dict(pd)
-
             # restaura dispositivos e pasta
             self._main_device  = settings.get('main_device', '')
             self._cue_device   = settings.get('cue_device', '')
@@ -3954,14 +4096,30 @@ class MainWindow(QMainWindow):
                 if isinstance(path, str):
                     PLAYED_PATHS.add(path)
 
-            # restaura layout de grid
+            # restaura layout de grid — reconstrói páginas com o layout correto
+            # ANTES de carregar as playlists, para evitar reflow em páginas parciais
             cols = settings.get('grid_cols', 3)
             rows = settings.get('grid_rows', 3)
             if (cols, rows) != (self._grid_cols, self._grid_rows):
-                self._set_grid_layout(cols, rows)
-                # recarrega playlists com o novo layout
-                for i, pd in enumerate(playlists[:len(self._pages)]):
-                    self._pages[i].from_dict(pd)
+                for page in self._pages:
+                    self._stack.removeWidget(page)
+                    page.deleteLater()
+                self._pages.clear()
+                self._grid_cols = cols
+                self._grid_rows = rows
+                for i in range(8):
+                    page = TabPage(i, cols, rows)
+                    page.sig_play.connect(self._play)
+                    page.sig_cue.connect(self._on_cue)
+                    page.sig_focus.connect(self._on_focus)
+                    self._pages.append(page)
+                    self._stack.addWidget(page)
+                self._stack.setCurrentIndex(0)
+                self._update_tab_btns(0)
+
+            # carrega playlists nas páginas já com o layout correto
+            for i, pd in enumerate(playlists[:len(self._pages)]):
+                self._pages[i].from_dict(pd)
 
         except Exception as e:
             print(f"load data: {e}")
