@@ -3183,7 +3183,6 @@ class MusicSearchDialog(QDialog):
             if not term or term in _normalize(Path(path).name):
                 item = QListWidgetItem(display_name(path))
                 item.setData(Qt.ItemDataRole.UserRole, path)
-                item.setToolTip(path)
                 self._list.addItem(item)
                 shown += 1
                 if shown >= self.MAX_RESULTS:
@@ -3200,6 +3199,17 @@ class MusicSearchDialog(QDialog):
         if shown > 0:
             self._list.setCurrentRow(0)
             self._list.setFocus()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._search_edit.clear()
+        self._list.clear()
+        n = len(self._all_files)
+        if n > 0:
+            self._status_lbl.setText(
+                f'{n} arquivo{"s" if n != 1 else ""} encontrado{"s" if n != 1 else ""}'
+                ' — digite e clique BUSCAR')
+        self._search_edit.setFocus()
 
     def set_playlists(self, names: list[str]):
         self._playlist_names = names
