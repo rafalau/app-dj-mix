@@ -1601,8 +1601,9 @@ class PlaylistPanel(QWidget):
 
     def __init__(self, name: str, color: str, parent=None):
         super().__init__(parent)
-        self._name   = name
-        self._color  = color
+        self._name         = name
+        self._default_name = name
+        self._color        = color
         self._songs: list[str] = []
         self._repeat = 0   # 0=off  1=repeat one  2=repeat all
         self.setAcceptDrops(True)
@@ -2051,6 +2052,8 @@ class PlaylistPanel(QWidget):
         self._repeat = 0
         self._apply_repeat_style()
         self._upd_count()
+        self._name = self._default_name
+        self._lbl.setText(self._default_name)
 
     def from_dict(self, d: dict):
         self._name = d.get('name', self._name)
@@ -2943,9 +2946,10 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle('Configurações')
         self.setModal(True)
-        self.setFixedSize(520, 340)
+        self.setFixedSize(520, 420)
         self._reset_played = False
         self._reset_all    = False
+        self._import_file  = ''
         self.setStyleSheet(f"background:{C['bg']};color:{C['text']};")
         _combo_style = f"""
             QComboBox{{
@@ -3031,6 +3035,26 @@ class SettingsDialog(QDialog):
 
         root.addLayout(form)
         root.addStretch()
+
+        _btn_style_backup = f"""
+            QPushButton{{background:{C['panel']};color:{C['accent_lt']};
+                border:1px solid {C['border2']};border-radius:5px;
+                font-size:11px;font-weight:bold;}}
+            QPushButton:hover{{background:{C['hover']};border-color:{C['accent_lt']};}}
+        """
+        backup_row = QHBoxLayout()
+        backup_row.setSpacing(8)
+        btn_export = QPushButton('📤  Exportar Configurações')
+        btn_export.setFixedHeight(32)
+        btn_export.setStyleSheet(_btn_style_backup)
+        btn_export.clicked.connect(self._do_export)
+        btn_import = QPushButton('📥  Importar Configurações')
+        btn_import.setFixedHeight(32)
+        btn_import.setStyleSheet(_btn_style_backup)
+        btn_import.clicked.connect(self._do_import)
+        backup_row.addWidget(btn_export)
+        backup_row.addWidget(btn_import)
+        root.addLayout(backup_row)
 
         btn_reset_played = QPushButton('↺  Resetar todas as músicas tocadas')
         btn_reset_played.setFixedHeight(32)
@@ -3122,6 +3146,43 @@ class SettingsDialog(QDialog):
         """)
         if msg.exec() == QMessageBox.StandardButton.Yes:
             self._reset_all = True
+            self.accept()
+
+    def _do_export(self):
+        import shutil
+        if not DATA_FILE.exists():
+            QMessageBox.warning(self, 'Exportar', 'Nenhuma configuração salva para exportar.')
+            return
+        dest, _ = QFileDialog.getSaveFileName(
+            self, 'Exportar Configurações', 'djmix_backup.json',
+            'JSON (*.json)')
+        if dest:
+            shutil.copy2(str(DATA_FILE), dest)
+            QMessageBox.information(self, 'Exportar', f'Configurações exportadas para:\n{dest}')
+
+    def _do_import(self):
+        src, _ = QFileDialog.getOpenFileName(
+            self, 'Importar Configurações', '',
+            'JSON (*.json)')
+        if not src:
+            return
+        msg = QMessageBox(self)
+        msg.setWindowTitle('Importar Configurações')
+        msg.setText('Importar vai substituir todas as configurações atuais.\nContinuar?')
+        msg.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        msg.setDefaultButton(QMessageBox.StandardButton.No)
+        msg.setStyleSheet(f"""
+            QMessageBox{{background:{C['bg']};color:{C['text']};}}
+            QLabel{{color:{C['text']};font-size:13px;}}
+            QPushButton{{background:{C['panel']};color:{C['text']};
+                border:1px solid {C['border2']};border-radius:5px;
+                font-size:12px;padding:5px 18px;min-width:70px;}}
+            QPushButton:hover{{background:{C['hover']};border-color:{C['accent_lt']};}}
+            QPushButton:default{{background:{C['accent']};color:#000;border:none;font-weight:bold;}}
+        """)
+        if msg.exec() == QMessageBox.StandardButton.Yes:
+            self._import_file = src
             self.accept()
 
     def _browse_folder(self):
@@ -3912,6 +3973,12 @@ class MainWindow(QMainWindow):
         dlg.exec()
         if dlg._reset_all:
             self._do_full_reset()
+            return
+        if dlg._import_file:
+            import shutil
+            DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(dlg._import_file, str(DATA_FILE))
+            self._load()
             return
         if dlg._reset_played:
             PLAYED_PATHS.clear()
