@@ -1,0 +1,75 @@
+# djmix_windows.spec — PyInstaller spec para DJ Mix Player (Windows)
+# Para buildar: pyinstaller djmix_windows.spec
+
+block_cipher = None
+
+a = Analysis(
+    ['main.py'],
+    pathex=[],
+    binaries=[],
+    datas=[
+        ('fonts',      'fonts'),
+        ('assets',     'assets'),
+        ('version.py', '.'),
+        ('updater.py', '.'),
+    ],
+    hiddenimports=[
+        'sounddevice',
+        'soundfile',
+        'cffi',
+        '_cffi_backend',
+        'numpy',
+        'pygame',
+        'pygame.mixer',
+        'pygame.sndarray',
+        'mutagen',
+        'mutagen.mp3',
+        'mutagen.flac',
+        'mutagen.mp4',
+        'mutagen.ogg',
+        'mutagen.wave',
+        'urllib.request',
+        'version',
+        'updater',
+    ],
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=['pulsectl'],
+    win_no_prefer_redirects=False,
+    win_private_assemblies=False,
+    cipher=block_cipher,
+    noarchive=False,
+)
+
+pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    [],
+    exclude_binaries=True,
+    name='DJMixPlayer',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    console=False,
+    icon='assets\\icon_256.ico',
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name='DJMixPlayer',
+)
