@@ -3171,15 +3171,21 @@ class _SFXBtn(QPushButton):
 
 
 class SettingsDialog(QDialog):
+    _sig_update_found = pyqtSignal(str, str, str)   # tag, url, body
+    _sig_no_update    = pyqtSignal()
+
     def __init__(self, devices: list, main_device: str, cue_device: str,
                  music_folder: str = '', parent=None):
         super().__init__(parent)
         self.setWindowTitle('Configurações')
         self.setModal(True)
         self.setFixedSize(520, 420)
-        self._reset_played = False
-        self._reset_all    = False
-        self._import_file  = ''
+        self._reset_played   = False
+        self._reset_all      = False
+        self._import_file    = ''
+        self._update_btn_ref = None
+        self._sig_update_found.connect(self._on_update_found)
+        self._sig_no_update.connect(self._on_no_update)
         self.setStyleSheet(f"background:{C['bg']};color:{C['text']};")
         _combo_style = f"""
             QComboBox{{
@@ -3410,38 +3416,80 @@ class SettingsDialog(QDialog):
             QMessageBox.information(self, 'Atualização', 'Verificador não disponível.')
             return
         from updater import check_for_update
-        import webbrowser
         self._update_btn_ref = self.sender()
         if self._update_btn_ref:
             self._update_btn_ref.setEnabled(False)
-            self._update_btn_ref.setText('Verificando...')  # não afeta o paintEvent mas desativa
-        def on_found(tag, dl_url, body):
-            if self._update_btn_ref:
-                self._update_btn_ref.setEnabled(True)
-            msg = QMessageBox(self)
-            msg.setWindowTitle('Atualização disponível!')
-            msg.setText(
-                f'<b>DJ Mix Player v{tag}</b> está disponível!<br>'
-                f'Versão atual: v{APP_VERSION}<br><br>'
-                f'Deseja abrir a página de download?'
-            )
-            if body:
-                msg.setDetailedText(body)
-            msg.setStandardButtons(
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-            msg.setDefaultButton(QMessageBox.StandardButton.Yes)
-            msg.setStyleSheet(f"background:{C['panel']};color:{C['text']};")
-            if msg.exec() == QMessageBox.StandardButton.Yes:
-                webbrowser.open(dl_url)
-        def on_none():
-            if self._update_btn_ref:
-                self._update_btn_ref.setEnabled(True)
-            msg = QMessageBox(self)
-            msg.setWindowTitle('Atualização')
-            msg.setText(f'Você já está na versão mais recente (v{APP_VERSION}).')
-            msg.setStyleSheet(f"background:{C['panel']};color:{C['text']};")
-            msg.exec()
-        check_for_update(on_update_found=on_found, on_no_update=on_none)
+        # Emitir sinais é thread-safe — o slot roda na thread principal
+        check_for_update(
+            on_update_found=lambda tag, url, body: self._sig_update_found.emit(tag, url, body),
+            on_no_update=lambda: self._sig_no_update.emit(),
+        )
+
+    @staticmethod
+    def _msg_style():
+        return f"""
+            QMessageBox {{
+                background: {C['panel']};
+                color: {C['text']};
+            }}
+            QLabel {{
+                color: {C['text']};
+                font-size: 13px;
+            }}
+            QPushButton {{
+                background: {C['panel2']};
+                color: {C['text']};
+                border: 1px solid {C['border2']};
+                border-radius: 6px;
+                font-size: 12px;
+                font-weight: bold;
+                padding: 6px 22px;
+                min-width: 80px;
+            }}
+            QPushButton:hover {{
+                background: {C['hover']};
+                border-color: {C['accent_lt']};
+            }}
+            QPushButton:default {{
+                background: {C['accent']};
+                color: #ffffff;
+                border: none;
+            }}
+            QPushButton:default:hover {{
+                background: {C['accent_lt']};
+            }}
+        """
+
+    def _on_update_found(self, tag: str, dl_url: str, body: str):
+        import webbrowser
+        if self._update_btn_ref:
+            self._update_btn_ref.setEnabled(True)
+        msg = QMessageBox(self)
+        msg.setWindowTitle('Atualização disponível!')
+        msg.setText(
+            f'<b>DJ Mix Player v{tag}</b> está disponível!<br>'
+            f'Versão atual: v{APP_VERSION}<br><br>'
+            f'Deseja abrir a página de download?'
+        )
+        if body:
+            msg.setDetailedText(body)
+        msg.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        msg.setDefaultButton(QMessageBox.StandardButton.Yes)
+        msg.setStyleSheet(self._msg_style())
+        if msg.exec() == QMessageBox.StandardButton.Yes:
+            webbrowser.open(dl_url)
+
+    def _on_no_update(self):
+        if self._update_btn_ref:
+            self._update_btn_ref.setEnabled(True)
+        msg = QMessageBox(self)
+        msg.setWindowTitle('Atualização')
+        msg.setText(f'Você já está na versão mais recente (v{APP_VERSION}).')
+        msg.setStandardButtons(QMessageBox.StandardButton.Ok)
+        msg.setDefaultButton(QMessageBox.StandardButton.Ok)
+        msg.setStyleSheet(self._msg_style())
+        msg.exec()
 
     def _browse_folder(self):
         folder = QFileDialog.getExistingDirectory(self, 'Selecionar pasta de músicas',
