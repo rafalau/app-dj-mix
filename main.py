@@ -3843,45 +3843,62 @@ class MainWindow(QMainWindow):
         self._refresh_cue_buttons()
 
     def _do_full_reset(self):
-        # Para tudo que estiver tocando
-        self._engine.stop()
-        self._cue_engine.stop()
-        self._sfx_fade_timer.stop()
-        self._sfx_restore_timer.stop()
-        self._sfx_engine.stop()
-        self._current    = None
-        self._cur_panel  = None
-        self._cur_row    = -1
+        try:
+            # Para tudo que estiver tocando
+            try: self._engine.stop()
+            except Exception as e: print(f"reset/engine: {e}")
+            try: self._cue_engine.stop()
+            except Exception as e: print(f"reset/cue: {e}")
+            try:
+                self._sfx_fade_timer.stop()
+                self._sfx_restore_timer.stop()
+                self._sfx_engine.stop()
+            except Exception as e: print(f"reset/sfx_stop: {e}")
+            self._current   = None
+            self._cur_panel = None
+            self._cur_row   = -1
 
-        # Limpa playlists e painéis
-        for pg in self._pages:
-            pg.set_playing(None)
-            for panel in pg.get_panels():
-                panel.clear_data()
-                panel.set_active(False)
+            # Limpa playlists e painéis
+            for pg in self._pages:
+                try: pg.set_playing(None)
+                except Exception as e: print(f"reset/set_playing: {e}")
+                for panel in pg.get_panels():
+                    try:
+                        panel.clear_data()
+                        panel.set_active(False)
+                    except Exception as e: print(f"reset/panel: {e}")
 
-        # Reseta slots de sonoplastia
-        for i in range(50):
-            self._sfx_engine.set_slot(i, None)
-        for btn in self._sfx_btns:
-            btn.setText('')
-            btn.setToolTip('')
-            btn.setStyleSheet(self._sfx_btn_style(None))
+            # Reseta slots de sonoplastia
+            for i in range(50):
+                self._sfx_engine.set_slot(i, None)
+            for btn in self._sfx_btns:
+                try:
+                    btn.setText('')
+                    btn.setToolTip('')
+                    btn.setStyleSheet(self._sfx_btn_style(None))
+                except Exception as e: print(f"reset/sfx_btn: {e}")
 
-        # Reseta configurações
-        self._main_device  = ''
-        self._cue_device   = ''
-        self._music_folder = ''
-        self._refresh_search_btn()
+            # Reseta configurações
+            self._main_device  = ''
+            self._cue_device   = ''
+            self._music_folder = ''
+            try: self._refresh_search_btn()
+            except Exception as e: print(f"reset/search_btn: {e}")
 
-        # Reseta histórico de tocadas e CUE points
-        PLAYED_PATHS.clear()
-        CUE_POINTS.clear()
-        CUE_FADEIN.clear()
+            # Reseta histórico de tocadas e CUE points
+            PLAYED_PATHS.clear()
+            CUE_POINTS.clear()
+            CUE_FADEIN.clear()
 
-        # Deleta arquivo de save e salva estado limpo
-        if DATA_FILE.exists():
-            DATA_FILE.unlink()
+        except Exception as e:
+            print(f"reset error: {e}")
+
+        # Sempre deleta o arquivo e salva estado limpo
+        try:
+            if DATA_FILE.exists():
+                DATA_FILE.unlink()
+        except Exception as e:
+            print(f"reset/unlink: {e}")
         self._save()
 
     def _open_settings(self):
