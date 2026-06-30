@@ -36,33 +36,70 @@ from PyQt6.QtGui import (QPainter, QColor, QLinearGradient, QRadialGradient, QFo
 
 # ── Optional backends ─────────────────────────────────────────────────────────
 try:
-    import pygame
-    pygame.mixer.pre_init(44100, -16, 2, 4096)
-    pygame.mixer.init()
+    import pygame as _pygame_mod
+    _pygame_mod.mixer.pre_init(44100, -16, 2, 2048)
     HAS_PYGAME = True
+    pygame = _pygame_mod
+    _PYGAME_MIXER_READY = False
 except Exception:
     HAS_PYGAME = False
+    _PYGAME_MIXER_READY = False
 
-try:
-    import sounddevice as sd
-    HAS_SD = True
-except Exception:
-    HAS_SD = False
+def _ensure_pygame_mixer():
+    """Inicializa pygame.mixer na primeira vez que for necessário."""
+    global _PYGAME_MIXER_READY
+    if not _PYGAME_MIXER_READY and HAS_PYGAME:
+        try:
+            pygame.mixer.init()
+            _PYGAME_MIXER_READY = True
+        except Exception:
+            pass
 
-try:
-    from mutagen import File as MutagenFile
-    HAS_MUTAGEN = True
-except Exception:
-    HAS_MUTAGEN = False
+# Valores iniciais — preenchidos pelo thread de import em background
+sd            = None
+sf            = None
+MutagenFile   = None
+HAS_SD        = False
+HAS_SF        = False
+HAS_MUTAGEN   = False
+HAS_FFMPEG    = False
 
-try:
-    import soundfile as sf
-    HAS_SF = True
-except ImportError:
-    HAS_SF = False
+# Evento que sinaliza quando os backends pesados estão prontos
+_backends_ready = threading.Event()
 
-import shutil as _shutil
-HAS_FFMPEG = _shutil.which('ffmpeg') is not None
+def _load_backends():
+    """Carrega sounddevice, soundfile e mutagen em background para não travar a abertura."""
+    global sd, sf, MutagenFile, HAS_SD, HAS_SF, HAS_MUTAGEN, HAS_FFMPEG
+    try:
+        import sounddevice as _sd
+        sd    = _sd
+        HAS_SD = True
+    except Exception:
+        pass
+    try:
+        import soundfile as _sf
+        sf    = _sf
+        HAS_SF = True
+    except Exception:
+        pass
+    try:
+        from mutagen import File as _mf
+        MutagenFile = _mf
+        HAS_MUTAGEN = True
+    except Exception:
+        pass
+    import shutil as _sh
+    HAS_FFMPEG = _sh.which('ffmpeg') is not None
+    _backends_ready.set()
+    # avisos de pacotes faltando — impressos aqui para não bloquear a abertura
+    if not HAS_MUTAGEN:
+        print("AVISO: mutagen não encontrado. Execute: pip install mutagen")
+    if not HAS_SD:
+        print("AVISO: sounddevice não encontrado. Execute: pip install sounddevice")
+    if not HAS_SF:
+        print("AVISO: soundfile não encontrado (necessário para CUE). Execute: pip install soundfile")
+
+threading.Thread(target=_load_backends, daemon=True, name='BackendLoader').start()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 AUDIO_EXTENSIONS = {'.mp3', '.mpa', '.wav', '.flac', '.ogg', '.aac', '.m4a', '.wma', '.opus', '.mp2', '.mp4'}
@@ -236,6 +273,7 @@ def _sd_output_devices() -> list[tuple[str, int]]:
     """Retorna (nome, índice_sd) de dispositivos de saída.
     Usa DirectSound no Windows (faz resampling automático, sem conflito de taxa).
     Fallback para WASAPI, depois qualquer output."""
+    _backends_ready.wait(timeout=5.0)
     if not HAS_SD:
         return []
     try:
@@ -389,6 +427,7 @@ class _LoadThread(QThread):
         self._path = path
 
     def run(self):
+        _backends_ready.wait(timeout=10.0)  # aguarda backends pesados carregarem
         data, sr = None, 44100.0
         if HAS_SF:
             try:
@@ -398,6 +437,7 @@ class _LoadThread(QThread):
         if data is None and HAS_PYGAME:
             try:
                 import numpy as np
+                _ensure_pygame_mixer()
                 sound = pygame.mixer.Sound(self._path)
                 arr   = pygame.sndarray.array(sound)
                 arr   = arr.astype('float32') / 32768.0
@@ -456,6 +496,8 @@ class AudioEngine(QObject):
         self._loader      = None   # _LoadThread em andamento
         self._fade_ramp   = None   # ramp pré-computado para fade-in
         self._fade_frames = 0      # frames restantes de fade-in no callback
+        self._fo_ramp     = None   # ramp pré-computado para fade-out (~5ms)
+        self._fade_out_frames = 0  # frames restantes de fade-out no callback
 
         self._tick_timer = QTimer()
         self._tick_timer.setInterval(40)
@@ -505,13 +547,26 @@ class AudioEngine(QObject):
         loader.start()
 
     def _on_loaded(self, data, sr):
-        self._data       = data
-        self._samplerate = int(sr)
-        self._channels   = data.shape[1] if data.ndim > 1 else 1
-        self._path       = getattr(self, '_loading_path', '')
-        self._duration   = int(len(data) / self._samplerate)
+        import numpy as np
+        new_sr = int(sr)
+        new_ch = data.shape[1] if data.ndim > 1 else 1
+        # pré-computa fade-in de ~10ms para eliminar estalo na entrada da nova música
+        n = max(1, new_sr // 100)
+        ramp = np.linspace(0.0, 1.0, n, dtype='float32').reshape(-1, 1)
+        need_restart = (new_sr != self._samplerate or new_ch != self._channels)
+        self._fade_out_frames = 0  # cancela fade-out pendente antes do swap
+        # swap atômico sob lock — callback continua rodando sem interrupção
         with self._lock:
-            self._cursor = _find_audio_start(data, int(sr))
+            self._data        = data
+            self._cursor      = _find_audio_start(data, new_sr)
+            self._fade_ramp   = ramp
+            self._fade_frames = n
+        self._samplerate = new_sr
+        self._channels   = new_ch
+        self._path       = getattr(self, '_loading_path', '')
+        self._duration   = int(len(data) / new_sr)
+        if need_restart and self._stream is not None:
+            self._close_stream()  # só reinicia se taxa/canais mudaram
         self.sig_dur.emit(self._duration)
         self.sig_loaded.emit(True)
 
@@ -528,7 +583,9 @@ class AudioEngine(QObject):
             return
         if self._state == 'playing':
             return
-        self._start_stream()
+        # reutiliza stream existente se ativo, cria apenas quando necessário
+        if self._stream is None or not self._stream.active:
+            self._start_stream()
         self._state = 'playing'
         self.sig_state.emit('playing')
 
@@ -538,27 +595,29 @@ class AudioEngine(QObject):
             self.sig_state.emit('paused')
 
     def stop(self):
+        if self._state == 'playing' and self._fo_ramp is not None:
+            # dispara fade-out de ~5ms no callback antes de silenciar
+            self._fade_out_frames = len(self._fo_ramp)
+        else:
+            with self._lock:
+                self._cursor = 0
         self._state = 'stopped'
-        self._close_stream()
-        with self._lock:
-            self._cursor = 0
         self.sig_state.emit('stopped')
         self.sig_pos.emit(0.0)
 
     def seek(self, pos: float):
         if self._data is None:
             return
+        import numpy as np
         new_cursor = int(max(0.0, min(1.0, pos)) * len(self._data))
-        was_playing = self._state == 'playing'
-        if was_playing:
-            # 'paused' impede _on_finished de emitir sig_ended ao fechar o stream
-            self._state = 'paused'
-            self._close_stream()
+        n = max(1, self._samplerate // 100)
+        ramp = np.linspace(0.0, 1.0, n, dtype='float32').reshape(-1, 1)
         with self._lock:
-            self._cursor = new_cursor
-        if was_playing:
+            self._cursor      = new_cursor
+            self._fade_ramp   = ramp
+            self._fade_frames = n
+        if self._state == 'playing' and (self._stream is None or not self._stream.active):
             self._start_stream()
-            self._state = 'playing'
             self.sig_state.emit('playing')
 
     def set_volume(self, v: float):
@@ -579,17 +638,22 @@ class AudioEngine(QObject):
     # ── internal ───────────────────────────────────────────────────────────
     def _start_stream(self):
         self._close_stream()
+        _backends_ready.wait(timeout=5.0)   # garante que sounddevice está disponível
         if not HAS_SD or self._data is None:
             return
-        # pré-computa ramp de fade-in de ~10 ms para eliminar estalo
         import numpy as np
+        # pré-computa ramp de fade-in de ~10 ms para eliminar estalo na entrada
         n = max(1, self._samplerate // 100)
         self._fade_ramp   = np.linspace(0.0, 1.0, n, dtype='float32').reshape(-1, 1)
         self._fade_frames = n
+        # pré-computa ramp de fade-out de ~5 ms para eliminar estalo na saída
+        n_fo = max(1, self._samplerate // 200)
+        self._fo_ramp = np.linspace(1.0, 0.0, n_fo, dtype='float32').reshape(-1, 1)
         kwargs = dict(
             samplerate=self._samplerate,
             channels=self._channels,
             dtype='float32',
+            blocksize=512,   # ~11ms — reduz latência e micro-travadas no Windows
             callback=self._callback,
             finished_callback=self._on_finished,
         )
@@ -624,11 +688,33 @@ class AudioEngine(QObject):
             self._stream = None
 
     def _callback(self, outdata, frames, time_info, status):
+        # fade-out tem prioridade — roda mesmo com state='stopped'
+        fo = self._fade_out_frames
+        if fo > 0 and self._fo_ramp is not None and self._data is not None:
+            ramp = self._fo_ramp
+            ramp_start = max(0, len(ramp) - fo)
+            with self._lock:
+                data  = self._data
+                start = self._cursor
+                chunk = data[start:start + frames]
+                self._cursor = min(start + frames, len(data))
+            apply_n = min(len(chunk), fo, frames)
+            if apply_n > 0:
+                r = ramp[ramp_start:ramp_start + apply_n]
+                outdata[:apply_n] = chunk[:apply_n] * self._volume * r
+            outdata[apply_n:] = 0
+            new_fo = max(0, fo - apply_n)
+            self._fade_out_frames = new_fo
+            if new_fo == 0:
+                with self._lock:
+                    self._cursor = 0
+            return
+
         if self._state != 'playing' or self._data is None:
             outdata[:] = 0
             return
-        data = self._data
         with self._lock:
+            data  = self._data   # dentro do lock para sincronizar com swap de música
             start = self._cursor
             end   = start + frames
             chunk = data[start:end]
@@ -663,8 +749,17 @@ class AudioEngine(QObject):
 
     def _tick(self):
         if self._state == 'playing':
-            self.sig_pos.emit(self._pos_frac())
+            frac = self._pos_frac()
+            self.sig_pos.emit(frac)
             self._animate_vu()
+            # detecta fim da música via timer (stream permanece ativo em silêncio)
+            if self._data is not None and frac >= 1.0:
+                self._state = 'stopped'
+                with self._lock:
+                    self._cursor = 0
+                self.sig_state.emit('stopped')
+                self.sig_pos.emit(0.0)
+                self.sig_ended.emit()
         else:
             self._decay_vu()
 
@@ -828,6 +923,7 @@ class CueEngine(QObject):
     # ── internal ───────────────────────────────────────────────────────────
     def _start_stream(self):
         self._close_stream()
+        _backends_ready.wait(timeout=5.0)
         if not HAS_SD or self._data is None:
             return
         import numpy as np
@@ -869,8 +965,8 @@ class CueEngine(QObject):
         if self._state != 'playing' or self._data is None:
             outdata[:] = 0
             return
-        data = self._data
         with self._lock:
+            data  = self._data   # dentro do lock para sincronizar com swap de música
             start = self._cursor
             end   = start + frames
             chunk = data[start:end]
@@ -1342,6 +1438,7 @@ class CueWindow(QDialog):
                     pass
             if data is None and HAS_PYGAME:
                 try:
+                    _ensure_pygame_mixer()
                     sound = pygame.mixer.Sound(path)
                     arr   = pygame.sndarray.array(sound).astype('float32') / 32768.0
                     if arr.ndim == 1:
@@ -2906,6 +3003,7 @@ class SFXEngine:
         path = self._slots[idx]
         if not path or not HAS_PYGAME:
             return 0.0
+        _ensure_pygame_mixer()
         try:
             sound = pygame.mixer.Sound(path)
             sound.play()
@@ -5179,12 +5277,6 @@ class MainWindow(QMainWindow):
 def main():
     if not HAS_PYGAME:
         print("AVISO: pygame não encontrado. Execute: pip install pygame")
-    if not HAS_MUTAGEN:
-        print("AVISO: mutagen não encontrado. Execute: pip install mutagen")
-    if not HAS_SD:
-        print("AVISO: sounddevice não encontrado. Execute: pip install sounddevice")
-    if not HAS_SF:
-        print("AVISO: soundfile não encontrado (necessário para CUE). Execute: pip install soundfile")
 
     app = QApplication(sys.argv)
     app.setApplicationName('DJ Mix Player')
