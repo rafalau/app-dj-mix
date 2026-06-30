@@ -6,7 +6,10 @@ block_cipher = None
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=[],
+    binaries=[
+        ('/usr/lib/x86_64-linux-gnu/libportaudio.so.2.0.0', '.'),
+        ('/usr/lib/x86_64-linux-gnu/libsndfile.so.1.0.37', '.'),
+    ],
     datas=[
         ('fonts',      'fonts'),
         ('assets',     'assets'),
@@ -31,10 +34,11 @@ a = Analysis(
         'urllib.request',
         'version',
         'updater',
+        'pulsectl',
     ],
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=['rthook_sounddevice.py'],
     excludes=[],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,

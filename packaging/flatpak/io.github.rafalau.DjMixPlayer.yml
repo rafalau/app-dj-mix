@@ -17,6 +17,7 @@ modules:
     buildsystem: simple
     build-commands:
       # Instala o bundle gerado pelo PyInstaller
+      - mkdir -p /app/lib
       - cp -r DJMixPlayer /app/lib/djmixplayer
       - chmod +x /app/lib/djmixplayer/DJMixPlayer
       # Launcher script

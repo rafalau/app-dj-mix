@@ -193,6 +193,45 @@ def _linux_pw_output_devices() -> list[tuple[str, int]]:
         return []
 
 
+def _linux_pactl_output_devices() -> list[tuple[str, int]]:
+    """Fallback via pulsectl quando pw-dump não está disponível (Flatpak).
+    Usa libpulse via ctypes — acessa PipeWire pelo socket PulseAudio.
+    Nomes de porta (ex.: 'HDMI / DisplayPort') coincidem com os do pw-dump."""
+    global _PW_NODE_MAP
+    try:
+        import pulsectl
+        from collections import Counter as _Counter
+        # No Flatpak não existe device 'pipewire'; usa 'pulse' ou 'default'
+        devs_enum = list(enumerate(sd.query_devices()))
+        pa_idx = None
+        for _hint in ('pipewire', 'pulse', 'default'):
+            pa_idx = next(
+                (i for i, d in devs_enum
+                 if d['name'] == _hint and d['max_output_channels'] > 0),
+                None
+            )
+            if pa_idx is not None:
+                break
+        if pa_idx is None:
+            return []
+        _PW_NODE_MAP = {}
+        result = []
+        with pulsectl.Pulse('djmix-enum') as pulse:
+            sinks = pulse.sink_list()
+            raw = []
+            for sink in sinks:
+                avail = [p for p in sink.port_list if str(p.available) != 'no']
+                raw.append(avail[0].description if len(avail) == 1 else sink.description)
+            count = _Counter(raw)
+            for sink, desc in zip(sinks, raw):
+                display = f'{desc} – {sink.description.split()[0]}' if count[desc] > 1 else desc
+                _PW_NODE_MAP[display] = sink.name
+                result.append((display, pa_idx))
+        return result
+    except Exception:
+        return []
+
+
 def _sd_output_devices() -> list[tuple[str, int]]:
     """Retorna (nome, índice_sd) de dispositivos de saída.
     Usa DirectSound no Windows (faz resampling automático, sem conflito de taxa).
@@ -209,6 +248,9 @@ def _sd_output_devices() -> list[tuple[str, int]]:
             pw_devs = _linux_pw_output_devices()
             if pw_devs:
                 return pw_devs
+            pa_devs = _linux_pactl_output_devices()
+            if pa_devs:
+                return pa_devs
         devs = sd.query_devices()
         result = []
         for i, d in enumerate(devs):
@@ -555,6 +597,7 @@ class AudioEngine(QObject):
             kwargs['device'] = self._device
         if self._pw_node:
             os.environ['PIPEWIRE_NODE'] = self._pw_node
+            os.environ['PULSE_SINK'] = self._pw_node
         try:
             self._stream = sd.OutputStream(**kwargs)
             self._stream.start()
@@ -569,6 +612,7 @@ class AudioEngine(QObject):
                 self._stream = None
         finally:
             os.environ.pop('PIPEWIRE_NODE', None)
+            os.environ.pop('PULSE_SINK', None)
 
     def _close_stream(self):
         if self._stream is not None:
@@ -801,6 +845,7 @@ class CueEngine(QObject):
             kwargs['device'] = self._device
         if self._pw_node:
             os.environ['PIPEWIRE_NODE'] = self._pw_node
+            os.environ['PULSE_SINK'] = self._pw_node
         try:
             self._stream = sd.OutputStream(**kwargs)
             self._stream.start()
@@ -809,6 +854,7 @@ class CueEngine(QObject):
             self._stream = None
         finally:
             os.environ.pop('PIPEWIRE_NODE', None)
+            os.environ.pop('PULSE_SINK', None)
 
     def _close_stream(self):
         if self._stream is not None:
@@ -3197,6 +3243,96 @@ class LayoutPickerBtn(QPushButton):
         p.end()
 
 
+class ShortcutsDialog(QDialog):
+    _SHORTCUTS = [
+        ('PLAYER PRINCIPAL', [
+            ('Espaço',          'Play / Pause'),
+            ('←  →',            'Retroceder / Avançar 2s'),
+            ('F1 – F5',         'Acionar CUE 1–5'),
+            ('Ctrl+F',          'Buscar música'),
+        ]),
+        ('PLAYLISTS  (aba atual)', [
+            ('Ctrl+1 – Ctrl+9', 'Focar playlist 1–9'),
+            ('Ctrl+Alt+0',      'Focar playlist 10'),
+            ('Ctrl+Alt+1',      'Focar playlist 11'),
+            ('Ctrl+Alt+2',      'Focar playlist 12'),
+            ('↑  ↓',            'Navegar nas músicas (playlist ativa)'),
+            ('Enter',           'Tocar música selecionada'),
+        ]),
+        ('ABAS', [
+            ('Alt+1 – Alt+8',   'Mudar para aba 1–8'),
+        ]),
+        ('SONOPLASTIA (CUE)', [
+            ('Espaço',          'Play / Pause'),
+            ('←  →',            'Retroceder / Avançar 2s'),
+            ('F1 – F5',         'Definir / ir para CUE 1–5'),
+        ]),
+    ]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('Atalhos do Teclado')
+        self.setModal(True)
+        self.setMinimumWidth(480)
+        self.setStyleSheet(f"""
+            QDialog{{background:{C['bg']};color:{C['text']};}}
+            QLabel{{color:{C['text']};}}
+        """)
+        root = QVBoxLayout(self)
+        root.setSpacing(16)
+        root.setContentsMargins(24, 20, 24, 20)
+
+        title = QLabel('ATALHOS DO TECLADO')
+        title.setStyleSheet(f"font-size:14px;font-weight:bold;color:{C['accent_lt']};letter-spacing:2px;")
+        root.addWidget(title)
+
+        sep = QWidget(); sep.setFixedHeight(1)
+        sep.setStyleSheet(f"background:{C['border2']};")
+        root.addWidget(sep)
+
+        for group_name, shortcuts in self._SHORTCUTS:
+            grp_lbl = QLabel(group_name)
+            grp_lbl.setStyleSheet(
+                f"font-size:10px;font-weight:bold;color:{C['text_dim']};"
+                f"letter-spacing:1px;margin-top:6px;"
+            )
+            root.addWidget(grp_lbl)
+
+            for key, desc in shortcuts:
+                row = QHBoxLayout()
+                row.setSpacing(12)
+
+                key_lbl = QLabel(key)
+                key_lbl.setFixedWidth(155)
+                key_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                key_lbl.setStyleSheet(f"""
+                    background:{C['panel2']};color:{C['accent_lt']};
+                    border:1px solid {C['border2']};border-radius:4px;
+                    font-size:11px;font-weight:bold;font-family:monospace;
+                    padding:3px 8px;
+                """)
+
+                desc_lbl = QLabel(desc)
+                desc_lbl.setStyleSheet(f"font-size:12px;color:{C['text']};")
+
+                row.addWidget(key_lbl)
+                row.addWidget(desc_lbl, 1)
+                root.addLayout(row)
+
+        root.addSpacing(4)
+        btn_close = QPushButton('Fechar')
+        btn_close.setFixedHeight(32)
+        btn_close.setStyleSheet(f"""
+            QPushButton{{background:{C['panel2']};color:{C['text']};
+                border:1px solid {C['border2']};border-radius:5px;
+                font-size:11px;font-weight:bold;padding:0 20px;}}
+            QPushButton:hover{{background:{C['hover']};color:{C['accent_lt']};
+                border-color:{C['accent_lt']};}}
+        """)
+        btn_close.clicked.connect(self.accept)
+        root.addWidget(btn_close, alignment=Qt.AlignmentFlag.AlignRight)
+
+
 class LayoutDialog(QDialog):
     GROUPS = [
         ('1 LINHA',  [(2, 1), (3, 1), (4, 1)]),
@@ -4000,17 +4136,17 @@ class MainWindow(QMainWindow):
 
         # Left sidebar with numbered tab buttons
         sidebar = QWidget()
-        sidebar.setFixedWidth(46)
+        sidebar.setFixedWidth(58)
         sidebar.setStyleSheet(
             f"background:{C['header']};border-right:1px solid {C['border2']};")
         sl = QVBoxLayout(sidebar)
-        sl.setContentsMargins(5, 10, 5, 10)
+        sl.setContentsMargins(3, 10, 3, 10)
         sl.setSpacing(6)
 
         self._tab_btns: list[QPushButton] = []
         for i in range(8):
             b = QPushButton(str(i + 1))
-            b.setFixedSize(36, 36)
+            b.setFixedSize(52, 36)
             b.setCheckable(True)
             b.setChecked(i == 0)
             b.clicked.connect(lambda _, idx=i: self._switch_tab(idx))
@@ -4019,17 +4155,28 @@ class MainWindow(QMainWindow):
 
         sl.addStretch()
 
-        # Botão único de layout
-        self._btn_layout = QPushButton('LAYOUT')
-        self._btn_layout.setFixedSize(52, 28)
-        self._btn_layout.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self._btn_layout.setStyleSheet(f"""
+        # Botão de atalhos
+        _small_btn_style = f"""
             QPushButton{{background:{C['panel']};color:{C['text_dim']};
                 border:1px solid {C['border2']};border-radius:4px;
                 font-size:8px;font-weight:bold;letter-spacing:1px;}}
             QPushButton:hover{{background:{C['hover']};color:{C['text']};
                 border-color:{C['accent_lt']};}}
-        """)
+        """
+        btn_shortcuts = QPushButton('ATALHOS')
+        btn_shortcuts.setFixedSize(52, 28)
+        btn_shortcuts.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        btn_shortcuts.setStyleSheet(_small_btn_style)
+        btn_shortcuts.clicked.connect(lambda: ShortcutsDialog(self).exec())
+        sl.addWidget(btn_shortcuts)
+
+        sl.addSpacing(4)
+
+        # Botão único de layout
+        self._btn_layout = QPushButton('LAYOUT')
+        self._btn_layout.setFixedSize(52, 28)
+        self._btn_layout.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._btn_layout.setStyleSheet(_small_btn_style)
         self._btn_layout.clicked.connect(self._open_layout_dialog)
         sl.addWidget(self._btn_layout)
 
