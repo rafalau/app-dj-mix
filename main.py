@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import (
     QLineEdit, QComboBox, QFileDialog, QMessageBox, QMenu,
     QTabWidget, QSizePolicy, QFrame, QScrollArea, QDialog,
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QMimeData, QUrl, QPointF, QRectF, QSize
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QMimeData, QUrl, QPointF, QRectF, QSize, QPoint
 from PyQt6.QtGui import (QPainter, QColor, QLinearGradient, QRadialGradient, QFont,
                          QDragEnterEvent, QDropEvent, QPolygonF, QFontDatabase,
                          QPixmap, QIcon, QPen, QShortcut, QKeySequence)
@@ -2940,6 +2940,96 @@ class LayoutDialog(QDialog):
         return self._cols, self._rows
 
 
+class _FlatBtn(QPushButton):
+    """Botão flat padronizado com ícone geométrico.
+    kind: 'export' | 'import' | 'reset_played' | 'reset_all'
+    """
+    _THEMES = {
+        'export':       ('#0d2a1a', '#163520', '#1a6632', '#00cc55', '#ccffdd'),
+        'import':       ('#0d1a2a', '#132035', '#1a3366', '#4499ff', '#cce0ff'),
+        'reset_played': ('#2a1e08', '#352510', '#664d00', '#ffaa22', '#fff0cc'),
+        'reset_all':    ('#2a0a0a', '#380e0e', '#8b0000', '#ff4444', '#ffcccc'),
+    }
+
+    def __init__(self, kind: str, label: str, parent=None):
+        super().__init__(parent)
+        self._kind    = kind
+        self._label   = label
+        self._hovered = False
+        self.setFixedHeight(36)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover)
+
+    def event(self, ev):
+        t = ev.type()
+        if t == t.HoverEnter:
+            self._hovered = True;  self.update()
+        elif t == t.HoverLeave:
+            self._hovered = False; self.update()
+        return super().event(ev)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+
+        base_bg, hover_bg, border_c, icon_c, text_c = (
+            QColor(v) for v in self._THEMES[self._kind])
+
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(hover_bg if self._hovered else base_bg)
+        p.drawRoundedRect(0, 0, w, h, 6, 6)
+        p.setPen(QPen(border_c, 1))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(1, 1, w - 2, h - 2, 5, 5)
+
+        ix, iy, sz = 12, (h - 16) // 2, 16
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(icon_c))
+
+        if self._kind == 'export':
+            p.drawRect(ix + 6, iy + 6, 4, 7)
+            p.drawPolygon(QPoint(ix + 8, iy), QPoint(ix + 2, iy + 8), QPoint(ix + 14, iy + 8))
+            p.drawRect(ix, iy + 13, 16, 3)
+        elif self._kind == 'import':
+            p.drawRect(ix, iy, 16, 3)
+            p.drawRect(ix + 6, iy + 3, 4, 7)
+            p.drawPolygon(QPoint(ix + 8, iy + 16), QPoint(ix + 2, iy + 8), QPoint(ix + 14, iy + 8))
+        elif self._kind == 'reset_played':
+            # seta circular (arco + ponta)
+            from PyQt6.QtGui import QPainterPath
+            path = QPainterPath()
+            path.moveTo(ix + 8, iy + 1)
+            path.arcTo(ix + 1, iy + 1, 14, 14, 90, -270)
+            stroke = QPen(QColor(icon_c), 3)
+            stroke.setCapStyle(Qt.PenCapStyle.RoundCap)
+            p.setPen(stroke)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawArc(ix + 1, iy + 1, 14, 14, 90 * 16, -300 * 16)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(icon_c))
+            p.drawPolygon(QPoint(ix + 8, iy), QPoint(ix + 3, iy + 5), QPoint(ix + 13, iy + 5))
+        else:  # reset_all — ícone de lixeira
+            p.drawRect(ix + 2, iy + 4, 12, 11)   # corpo
+            p.drawRect(ix,     iy + 3,  16, 2)    # tampa
+            p.drawRect(ix + 5, iy,       6, 3)    # alça
+            p.setBrush(QColor(base_bg if not self._hovered else hover_bg))
+            for lx in (ix + 5, ix + 8, ix + 11):
+                p.drawRect(lx, iy + 6, 2, 6)      # listras internas
+
+        font = self.font()
+        font.setPointSize(10)
+        font.setBold(True)
+        font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1)
+        p.setFont(font)
+        p.setPen(QColor(text_c))
+        p.drawText(self.rect().adjusted(ix + sz + 10, 0, -8, 0),
+                   Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                   self._label.upper())
+        p.end()
+
+
 class SettingsDialog(QDialog):
     def __init__(self, devices: list, main_device: str, cue_device: str,
                  music_folder: str = '', parent=None):
@@ -3020,11 +3110,14 @@ class SettingsDialog(QDialog):
                 border-radius:5px;color:{C['text']};padding:5px 10px;font-size:12px;
             }}
         """)
-        btn_browse = QPushButton('...')
-        btn_browse.setFixedSize(34, 34)
+        btn_browse = QPushButton('···')
+        btn_browse.setFixedWidth(36)
+        self._folder_edit.setFixedHeight(34)
+        btn_browse.setFixedHeight(34)
         btn_browse.setStyleSheet(f"""
             QPushButton{{background:{C['panel2']};color:{C['text']};
-                border:1px solid {C['border2']};border-radius:5px;font-weight:bold;}}
+                border:1px solid {C['border2']};border-radius:5px;
+                font-weight:bold;font-size:13px;}}
             QPushButton:hover{{background:{C['hover']};border-color:{C['accent_lt']};}}
         """)
         btn_browse.clicked.connect(self._browse_folder)
@@ -3036,46 +3129,26 @@ class SettingsDialog(QDialog):
         root.addLayout(form)
         root.addStretch()
 
-        _btn_style_backup = f"""
-            QPushButton{{background:{C['panel']};color:{C['accent_lt']};
-                border:1px solid {C['border2']};border-radius:5px;
-                font-size:11px;font-weight:bold;}}
-            QPushButton:hover{{background:{C['hover']};border-color:{C['accent_lt']};}}
-        """
-        backup_row = QHBoxLayout()
-        backup_row.setSpacing(8)
-        btn_export = QPushButton('📤  Exportar Configurações')
-        btn_export.setFixedHeight(32)
-        btn_export.setStyleSheet(_btn_style_backup)
+        # ── Ações (2 linhas × 2 botões, estilo uniforme) ──────────────
+        row1 = QHBoxLayout()
+        row1.setSpacing(8)
+        btn_export = _FlatBtn('export', 'Exportar Config.')
         btn_export.clicked.connect(self._do_export)
-        btn_import = QPushButton('📥  Importar Configurações')
-        btn_import.setFixedHeight(32)
-        btn_import.setStyleSheet(_btn_style_backup)
+        btn_import = _FlatBtn('import', 'Importar Config.')
         btn_import.clicked.connect(self._do_import)
-        backup_row.addWidget(btn_export)
-        backup_row.addWidget(btn_import)
-        root.addLayout(backup_row)
+        row1.addWidget(btn_export)
+        row1.addWidget(btn_import)
+        root.addLayout(row1)
 
-        btn_reset_played = QPushButton('↺  Resetar todas as músicas tocadas')
-        btn_reset_played.setFixedHeight(32)
-        btn_reset_played.setStyleSheet(f"""
-            QPushButton{{background:{C['panel']};color:#ff8844;
-                border:1px solid #7a3300;border-radius:5px;font-size:11px;}}
-            QPushButton:hover{{background:#3a1a00;border-color:#ff8844;}}
-        """)
+        row2 = QHBoxLayout()
+        row2.setSpacing(8)
+        btn_reset_played = _FlatBtn('reset_played', 'Resetar Tocadas')
         btn_reset_played.clicked.connect(self._do_reset_played)
-        root.addWidget(btn_reset_played)
-
-        btn_reset_all = QPushButton('⚠  RESETAR CONFIGURAÇÕES — Apagar tudo e voltar ao zero')
-        btn_reset_all.setFixedHeight(34)
-        btn_reset_all.setStyleSheet(f"""
-            QPushButton{{background:#2a0a0a;color:#ff4444;
-                border:1px solid #8b0000;border-radius:5px;
-                font-size:11px;font-weight:bold;letter-spacing:0.5px;}}
-            QPushButton:hover{{background:#400000;border-color:#ff4444;}}
-        """)
+        btn_reset_all = _FlatBtn('reset_all', 'Resetar Configurações')
         btn_reset_all.clicked.connect(self._do_reset_all)
-        root.addWidget(btn_reset_all)
+        row2.addWidget(btn_reset_played)
+        row2.addWidget(btn_reset_all)
+        root.addLayout(row2)
 
         _btn_style_cancel = f"""
             QPushButton{{background:{C['panel']};color:{C['text']};
@@ -3932,11 +4005,8 @@ class MainWindow(QMainWindow):
             # Reseta slots de sonoplastia
             for i in range(50):
                 self._sfx_engine.set_slot(i, None)
-            for btn in self._sfx_btns:
-                try:
-                    btn.setText('')
-                    btn.setToolTip('')
-                    btn.setStyleSheet(self._sfx_btn_style(None))
+            for i in range(10):
+                try: self._sfx_refresh_btn(self._sfx_page * 10 + i)
                 except Exception as e: print(f"reset/sfx_btn: {e}")
 
             # Reseta configurações
