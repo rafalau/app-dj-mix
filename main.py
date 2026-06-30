@@ -268,10 +268,12 @@ class AudioEngine(QObject):
         self._device = new_idx
         if self._state in ('playing', 'paused'):
             was_playing = self._state == 'playing'
+            self._state = 'paused'   # impede _on_finished de emitir sig_ended
             self._close_stream()
             self._start_stream()
-            if not was_playing:
-                self._state = 'paused'
+            if was_playing:
+                self._state = 'playing'
+            else:
                 self.sig_state.emit('paused')
 
     def load(self, path: str) -> bool:
@@ -339,6 +341,8 @@ class AudioEngine(QObject):
         new_cursor = int(max(0.0, min(1.0, pos)) * len(self._data))
         was_playing = self._state == 'playing'
         if was_playing:
+            # 'paused' impede _on_finished de emitir sig_ended ao fechar o stream
+            self._state = 'paused'
             self._close_stream()
         with self._lock:
             self._cursor = new_cursor
@@ -567,6 +571,7 @@ class CueEngine(QObject):
         new_cursor = int(max(0.0, min(1.0, frac)) * total)
         was_playing = self._state == 'playing'
         if was_playing:
+            self._state = 'paused'   # impede _on_finished de emitir sig_ended
             self._close_stream()
         with self._lock:
             self._cursor = new_cursor
@@ -3912,7 +3917,11 @@ class MainWindow(QMainWindow):
         use_fade = _cue_fadein(path)[idx]
         was_playing = self._engine.state == 'playing'
         if use_fade:
-            target_vol = self._engine._volume
+            # Se já há um fade em andamento, usa o target dele (não o volume mid-fade)
+            fade_active = hasattr(self, '_fade_timer') and self._fade_timer.isActive()
+            target_vol = self._fade_target if fade_active else self._engine._volume
+            if fade_active:
+                self._fade_timer.stop()
             self._engine.set_volume(0.0)
         self._engine.seek(frac)
         if not was_playing:
