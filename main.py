@@ -3846,15 +3846,19 @@ class MainWindow(QMainWindow):
         # Para tudo que estiver tocando
         self._engine.stop()
         self._cue_engine.stop()
-        if self._sfx_engine.active_idx is not None:
-            self._sfx_fade_timer.stop()
-            self._sfx_restore_timer.stop()
-            self._sfx_engine.stop()
+        self._sfx_fade_timer.stop()
+        self._sfx_restore_timer.stop()
+        self._sfx_engine.stop()
+        self._current    = None
+        self._cur_panel  = None
+        self._cur_row    = -1
 
         # Limpa playlists e painéis
         for pg in self._pages:
+            pg.set_playing(None)
             for panel in pg.get_panels():
                 panel.clear_data()
+                panel.set_active(False)
 
         # Reseta slots de sonoplastia
         for i in range(50):
@@ -3870,13 +3874,8 @@ class MainWindow(QMainWindow):
         self._music_folder = ''
         self._refresh_search_btn()
 
-        # Reseta histórico de tocadas
+        # Reseta histórico de tocadas e CUE points
         PLAYED_PATHS.clear()
-        for pg in self._pages:
-            for panel in pg.get_panels():
-                panel._list.viewport().update()
-
-        # Reseta CUE points
         CUE_POINTS.clear()
         CUE_FADEIN.clear()
 
