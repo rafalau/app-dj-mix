@@ -10,6 +10,7 @@ import math
 import time
 import random
 import threading
+import unicodedata
 import urllib.request
 from pathlib import Path
 
@@ -60,9 +61,18 @@ try:
 except ImportError:
     HAS_SF = False
 
+import shutil as _shutil
+HAS_FFMPEG = _shutil.which('ffmpeg') is not None
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 AUDIO_EXTENSIONS = {'.mp3', '.mpa', '.wav', '.flac', '.ogg', '.aac', '.m4a', '.wma', '.opus', '.mp2', '.mp4'}
-FORMATS_FILTER = "Áudio (*.mp3 *.mpa *.wav *.flac *.ogg *.aac *.m4a *.wma *.opus *.mp2 *.mp4);;Todos (*.*)"
+FORMATS_FILTER = (
+    "Áudio ("
+    "*.mp3 *.MP3 *.mpa *.MPA *.wav *.WAV *.flac *.FLAC "
+    "*.ogg *.OGG *.aac *.AAC *.m4a *.M4A *.wma *.WMA "
+    "*.opus *.OPUS *.mp2 *.MP2 *.mp4 *.MP4"
+    ");;Todos (*.*)"
+)
 
 
 def _flat_icon(kind: str, size: int = 16, color: str = '#ffffff') -> QIcon:
@@ -305,6 +315,11 @@ def display_name(path: str) -> str:
     return name.upper()
 
 
+def _normalize(s: str) -> str:
+    """Remove acentos e converte para minúsculas — busca tolerante a acentuação."""
+    return unicodedata.normalize('NFD', s).encode('ascii', 'ignore').decode('ascii').lower()
+
+
 # ── Auto-Cue ─────────────────────────────────────────────────────────────────
 _AUTOCUE_THRESHOLD = 0.01   # -40 dB: limiar para considerar "início do áudio"
 _AUTOCUE_MARGIN_S  = 0.08   # 80 ms de margem antes do ponto detectado
@@ -348,8 +363,22 @@ class _LoadThread(QThread):
                     arr = arr.reshape(-1, 1)
                 data = arr
                 sr   = float(pygame.mixer.get_init()[0] or 44100)
+            except Exception:
+                pass
+        if data is None and HAS_FFMPEG:
+            try:
+                import subprocess, numpy as np
+                proc = subprocess.run(
+                    ['ffmpeg', '-i', self._path,
+                     '-f', 'f32le', '-ar', '44100', '-ac', '2', 'pipe:1'],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+                )
+                if proc.returncode == 0 and proc.stdout:
+                    arr  = np.frombuffer(proc.stdout, dtype='float32').reshape(-1, 2)
+                    data = arr
+                    sr   = 44100.0
             except Exception as e:
-                print(f"_LoadThread fallback error: {e}")
+                print(f"_LoadThread ffmpeg fallback error: {e}")
         if data is None:
             self.sig_failed.emit()
             return
@@ -1272,8 +1301,20 @@ class CueWindow(QDialog):
                     if arr.ndim == 1:
                         arr = arr.reshape(-1, 1)
                     data = arr
-                except Exception as e2:
-                    print(f"waveform pygame fallback: {e2}")
+                except Exception:
+                    pass
+            if data is None and HAS_FFMPEG:
+                try:
+                    import subprocess
+                    proc = subprocess.run(
+                        ['ffmpeg', '-i', path,
+                         '-f', 'f32le', '-ar', '44100', '-ac', '2', 'pipe:1'],
+                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+                    )
+                    if proc.returncode == 0 and proc.stdout:
+                        data = np.frombuffer(proc.stdout, dtype='float32').reshape(-1, 2)
+                except Exception as e3:
+                    print(f"waveform ffmpeg fallback: {e3}")
             if data is None:
                 self.sig_waveform_error.emit('Waveform não disponível para este formato')
                 return
@@ -1465,7 +1506,9 @@ class CueWindow(QDialog):
 
     def eventFilter(self, obj, event):
         from PyQt6.QtCore import QEvent
-        if self.isVisible() and event.type() == QEvent.Type.KeyPress:
+        if (self.isVisible()
+                and QApplication.activeWindow() is self
+                and event.type() == QEvent.Type.KeyPress):
             key  = event.key()
             mods = event.modifiers()
             ctrl  = bool(mods & Qt.KeyboardModifier.ControlModifier)
@@ -1852,7 +1895,6 @@ class SongItem(QListWidgetItem):
         self.setData(self._PATH_ROLE, path)
         self.setData(self._NAME_ROLE, name)
         self.setText(f"  {name}")
-        self.setToolTip(path)
 
     @property
     def path(self) -> str:
@@ -1860,7 +1902,8 @@ class SongItem(QListWidgetItem):
 
     def matches(self, q: str) -> bool:
         name = self.data(self._NAME_ROLE)
-        return q in name.lower() or q in Path(self.path).name.lower()
+        q_n  = _normalize(q)
+        return q_n in _normalize(name) or q_n in _normalize(Path(self.path).name)
 
 
 class PlaylistPanel(QWidget):
@@ -2031,8 +2074,17 @@ class PlaylistPanel(QWidget):
         self._list.keyPressEvent = self._list_key_press
         layout.addWidget(self._list)
 
-    def _apply_list_style(self, active: bool):
-        if active:
+    def _apply_list_style(self, active):
+        if active == 'focused':
+            bg_color     = '#0d2a30'
+            border_color = '#1a6070'
+            text_color   = '#e0f4f8'
+            sel_color    = '#1a5a6a'
+            hover_color  = '#143a44'
+            item_border  = 'rgba(180,230,240,.10)'
+            scroll_bg    = '#0a1e24'
+            scroll_hdl   = '#1a6070'
+        elif active:
             bg_color     = '#0d3a7a'
             border_color = '#1565c0'
             text_color   = '#ffffff'
@@ -2095,6 +2147,13 @@ class PlaylistPanel(QWidget):
         self._hdr.setStyleSheet(
             f"background:{hdr_bg};border-radius:3px 3px 0 0;"
         )
+        self._list.update()
+        self._hdr.update()
+
+    def set_focused(self):
+        """Estado de seleção via teclado/clique — tom teal, diferente do azul de tocando."""
+        self._apply_list_style('focused')
+        self._hdr.setStyleSheet("background:#1a6070;border-radius:3px 3px 0 0;")
         self._list.update()
         self._hdr.update()
 
@@ -2229,8 +2288,8 @@ class PlaylistPanel(QWidget):
         menu = QMenu(self)
         menu.setStyleSheet(f"""
             QMenu{{background:{C['panel2']};border:1px solid {C['border2']};
-                   color:{C['text']};padding:4px;}}
-            QMenu::item{{padding:5px 18px;border-radius:3px;}}
+                   color:{C['text']};padding:4px;font-size:14px;font-weight:bold;}}
+            QMenu::item{{padding:7px 20px;border-radius:3px;}}
             QMenu::item:selected{{background:{C['sel']};}}
         """)
         if item:
@@ -2970,14 +3029,14 @@ class MusicSearchDialog(QDialog):
             self._search_edit.setFocus()
 
     def _do_search(self):
-        term = self._search_edit.text().lower().strip()
+        term = _normalize(self._search_edit.text().strip())
         if not self._all_files:
             return
         self._list.setUpdatesEnabled(False)
         self._list.clear()
         shown = 0
         for path in self._all_files:
-            if not term or term in Path(path).name.lower():
+            if not term or term in _normalize(Path(path).name):
                 item = QListWidgetItem(display_name(path))
                 item.setData(Qt.ItemDataRole.UserRole, path)
                 item.setToolTip(path)
@@ -3870,7 +3929,7 @@ class MainWindow(QMainWindow):
         """
         self._cue_btns: list[QPushButton] = []
         for i in range(1, 6):
-            b = QPushButton(f'CUE {i}')
+            b = QPushButton(f'CUE {i}  (F{i})')
             b.setFixedHeight(34)
             b.setCheckable(True)
             b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -3881,7 +3940,7 @@ class MainWindow(QMainWindow):
         tbl.addSpacing(12)
 
         # Buscar música button
-        self._btn_search = QPushButton('  BUSCAR MÚSICA')
+        self._btn_search = QPushButton('  BUSCAR MÚSICA  (Ctrl+F)')
         self._btn_search.setIcon(_flat_icon('lupa', 15, '#cccccc'))
         self._btn_search.setIconSize(QSize(15, 15))
         self._btn_search.setFixedHeight(34)
@@ -4111,6 +4170,98 @@ class MainWindow(QMainWindow):
             sc.setContext(Qt.ShortcutContext.WindowShortcut)
             sc.activated.connect(lambda idx=i: self._play_sfx(idx))
 
+        QApplication.instance().installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        from PyQt6.QtCore import QEvent
+        if (event.type() == QEvent.Type.KeyPress
+                and QApplication.activeWindow() is self):
+            focused = QApplication.focusWidget()
+            if isinstance(focused, QLineEdit):
+                return False
+            key   = event.key()
+            mods  = event.modifiers()
+            ctrl  = bool(mods & Qt.KeyboardModifier.ControlModifier)
+            alt   = bool(mods & Qt.KeyboardModifier.AltModifier)
+            shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+            plain = not ctrl and not alt and not shift
+
+            _NUM = {
+                Qt.Key.Key_0: 0, Qt.Key.Key_1: 1, Qt.Key.Key_2: 2,
+                Qt.Key.Key_3: 3, Qt.Key.Key_4: 4, Qt.Key.Key_5: 5,
+                Qt.Key.Key_6: 6, Qt.Key.Key_7: 7, Qt.Key.Key_8: 8,
+                Qt.Key.Key_9: 9,
+            }
+
+            # Ctrl+Alt+0,1,2 → playlists 10, 11, 12
+            if ctrl and alt and not shift and key in (Qt.Key.Key_0, Qt.Key.Key_1, Qt.Key.Key_2):
+                self._focus_playlist(9 + _NUM[key])
+                return True
+
+            # Alt+1…9 → abas (índice 0–7; 9 ignorado se não existir)
+            if alt and not ctrl and not shift and key in _NUM:
+                tab_idx = _NUM[key] - 1
+                if 0 <= tab_idx < len(self._pages):
+                    self._switch_tab(tab_idx)
+                    self._focus_playlist(0)
+                return True
+
+            # Ctrl+F → busca  |  Ctrl+1…9 → playlists 1–9
+            if ctrl and not alt and not shift:
+                if key == Qt.Key.Key_F and self._btn_search.isEnabled():
+                    self._open_search()
+                    return True
+                if key in _NUM and _NUM[key] >= 1:
+                    self._focus_playlist(_NUM[key] - 1)
+                    return True
+
+            # Espaço → play/pause
+            if plain and key == Qt.Key.Key_Space:
+                if self._engine.state == 'playing':
+                    self._engine.pause()
+                else:
+                    self._engine.play()
+                return True
+
+            # ← → seek ±2s  |  F1–F5 → CUE  (sem modificadores)
+            if plain:
+                dur = self._engine.duration
+                if dur > 0 and key in (Qt.Key.Key_Left, Qt.Key.Key_Right):
+                    delta = 2.0 / dur
+                    frac  = self._engine._pos_frac()
+                    self._engine.seek(max(0.0, frac - delta) if key == Qt.Key.Key_Left
+                                      else min(1.0, frac + delta))
+                    return True
+                _FN = {Qt.Key.Key_F1: 0, Qt.Key.Key_F2: 1, Qt.Key.Key_F3: 2,
+                       Qt.Key.Key_F4: 3, Qt.Key.Key_F5: 4}
+                if key in _FN:
+                    self._on_cue_btn(_FN[key])
+                    return True
+        return False
+
+    def _focus_playlist(self, idx: int):
+        cur_page = self._pages[self._stack.currentIndex()]
+        panels   = cur_page.get_panels()
+        if idx >= len(panels):
+            return
+        target = panels[idx]
+        for p in panels:
+            is_playing = bool(self._current and self._current in p._songs)
+            if is_playing:
+                p.set_active(True)
+            elif p is target:
+                p.set_focused()
+            else:
+                p.set_active(False)
+        lst = target._list
+        lst.setFocus()
+        if lst.currentRow() < 0 and lst.count() > 0:
+            for i in range(lst.count()):
+                item = lst.item(i)
+                if item and not item.isHidden():
+                    lst.setCurrentRow(i)
+                    break
+
     def _on_cue_changed(self, path: str):
         # Repaint all playlist lists so the CUE badge appears/updates
         for pg in self._pages:
@@ -4121,6 +4272,19 @@ class MainWindow(QMainWindow):
     def _on_focus(self, path: str):
         self._focused = path
         self._refresh_cue_buttons()
+        self._update_focused_panel_style(path)
+
+    def _update_focused_panel_style(self, path: str):
+        for pg in self._pages:
+            for panel in pg.get_panels():
+                is_playing = bool(self._current and self._current in panel._songs)
+                is_focused = path in panel._songs
+                if is_playing:
+                    panel.set_active(True)
+                elif is_focused:
+                    panel.set_focused()
+                else:
+                    panel.set_active(False)
 
     def _refresh_cue_buttons(self):
         CUE_SLOT_COLORS = ['#7a5800', '#7a3000', '#005533', '#440077', '#770022']
@@ -4855,6 +5019,7 @@ class MainWindow(QMainWindow):
             print(f"load data: {e}")
 
     def closeEvent(self, ev):
+        QApplication.instance().removeEventFilter(self)
         self._save()
         self._engine.stop()
         self._cue_engine.stop()
