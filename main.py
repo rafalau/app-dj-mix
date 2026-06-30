@@ -172,12 +172,17 @@ def _linux_pw_output_devices() -> list[tuple[str, int]]:
                 pw_dump_cmd = _bundled
         data = json.loads(subprocess.check_output([pw_dump_cmd], stderr=subprocess.DEVNULL, timeout=3))
 
-        # Device 'pipewire' do sounddevice (ALSA virtual que roteia pelo PipeWire)
-        pipewire_idx = next(
-            (i for i, d in enumerate(sd.query_devices())
-             if d['name'] == 'pipewire' and d['max_output_channels'] > 0),
-            None
-        )
+        # Device preferido: 'pipewire' (nativo) → 'pulse' → 'default' (Flatpak)
+        _sd_devs = list(enumerate(sd.query_devices()))
+        pipewire_idx = None
+        for _hint in ('pipewire', 'pulse', 'default'):
+            pipewire_idx = next(
+                (i for i, d in _sd_devs
+                 if d['name'] == _hint and d['max_output_channels'] > 0),
+                None
+            )
+            if pipewire_idx is not None:
+                break
         if pipewire_idx is None:
             return []
 
