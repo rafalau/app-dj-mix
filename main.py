@@ -106,6 +106,83 @@ PLAYED_PATHS: set[str]        = set()  # paths que já foram tocados
 _MUSIC_FOLDER: str            = ''   # pasta padrão para diálogos de arquivo
 
 
+# display_name → PipeWire node.name (para roteamento via PIPEWIRE_NODE)
+_PW_NODE_MAP: dict[str, str] = {}
+
+
+def _linux_pw_output_devices() -> list[tuple[str, int]]:
+    """No Linux, usa EnumRoute do PipeWire com device 'pipewire' para roteamento correto.
+    Usa PIPEWIRE_NODE env var para selecionar o sink específico — isso preserva
+    volume do sistema e resampling automático via PipeWire."""
+    global _PW_NODE_MAP
+    try:
+        import subprocess, re
+        from collections import Counter
+        data = json.loads(subprocess.check_output(['pw-dump'], stderr=subprocess.DEVNULL, timeout=3))
+
+        # Device 'pipewire' do sounddevice (ALSA virtual que roteia pelo PipeWire)
+        pipewire_idx = next(
+            (i for i, d in enumerate(sd.query_devices())
+             if d['name'] == 'pipewire' and d['max_output_channels'] > 0),
+            None
+        )
+        if pipewire_idx is None:
+            return []
+
+        # card_num → node.name do PipeWire (para PIPEWIRE_NODE)
+        card_node: dict[int, str] = {}
+        for obj in data:
+            if obj.get('type') == 'PipeWire:Interface:Node':
+                props = obj.get('info', {}).get('props', {})
+                if props.get('media.class', '') in ('Audio/Sink', 'Audio/Duplex'):
+                    card_num  = props.get('alsa.card')
+                    node_name = props.get('node.name', '')
+                    if card_num is not None and node_name:
+                        card_node[int(card_num)] = node_name
+
+        # EnumRoute por Device
+        card_routes: dict[int, list[tuple[str, str, str]]] = {}
+        for obj in data:
+            if obj.get('type') != 'PipeWire:Interface:Device':
+                continue
+            props = obj.get('info', {}).get('props', {})
+            card_num = props.get('alsa.card')
+            if card_num is None:
+                continue
+            card_num  = int(card_num)
+            card_name = props.get('alsa.card_name', '')
+            params    = obj.get('info', {}).get('params', {})
+            enum_routes = params.get('EnumRoute', [])
+            if not isinstance(enum_routes, list):
+                enum_routes = [enum_routes] if enum_routes else []
+            for r in enum_routes:
+                if r.get('direction') != 'Output' or r.get('available') == 'no':
+                    continue
+                desc = r.get('description', '')
+                if desc:
+                    card_routes.setdefault(card_num, []).append((desc, card_name))
+        if not card_routes:
+            return []
+
+        all_descs = [desc for routes in card_routes.values() for desc, _ in routes]
+        desc_count = Counter(all_descs)
+        cards_with_multi = {c for c, r in card_routes.items() if len(r) > 1}
+
+        _PW_NODE_MAP = {}
+        result = []
+        for card in sorted(card_routes):
+            node_name = card_node.get(card, '')
+            for desc, card_name in card_routes[card]:
+                display = desc
+                if card in cards_with_multi or desc_count[desc] > 1:
+                    display = f'{desc} – {card_name}'
+                _PW_NODE_MAP[display] = node_name
+                result.append((display, pipewire_idx))
+        return result
+    except Exception:
+        return []
+
+
 def _sd_output_devices() -> list[tuple[str, int]]:
     """Retorna (nome, índice_sd) de dispositivos de saída.
     Usa DirectSound no Windows (faz resampling automático, sem conflito de taxa).
@@ -118,6 +195,10 @@ def _sd_output_devices() -> list[tuple[str, int]]:
         ds_idx     = next((i for i, a in enumerate(apis) if 'DirectSound' in a['name']), None)
         wasapi_idx = next((i for i, a in enumerate(apis) if 'WASAPI'      in a['name']), None)
         target_api = ds_idx if ds_idx is not None else wasapi_idx
+        if target_api is None and sys.platform != 'win32':
+            pw_devs = _linux_pw_output_devices()
+            if pw_devs:
+                return pw_devs
         devs = sd.query_devices()
         result = []
         for i, d in enumerate(devs):
@@ -248,6 +329,8 @@ class AudioEngine(QObject):
         self._vu_l       = 0.0
         self._vu_r       = 0.0
 
+        self._pw_node       = None   # PipeWire node.name para roteamento
+
         self._tick_timer = QTimer()
         self._tick_timer.setInterval(40)
         self._tick_timer.timeout.connect(self._tick)
@@ -260,9 +343,11 @@ class AudioEngine(QObject):
     def set_device(self, name: str):
         if not name or name == 'Dispositivo padrão':
             new_idx = None
+            self._pw_node = None
         else:
             pairs   = _sd_output_devices()
             new_idx = next((idx for n, idx in pairs if n == name), None)
+            self._pw_node = _PW_NODE_MAP.get(name)
         if new_idx == self._device:
             return
         self._device = new_idx
@@ -299,11 +384,11 @@ class AudioEngine(QObject):
         if data is None:
             self.sig_state.emit('stopped')
             raise RuntimeError(f"Não foi possível carregar: {path}")
-        self._data       = data
-        self._samplerate = int(sr)
-        self._channels   = data.shape[1] if data.ndim > 1 else 1
-        self._path       = path
-        self._duration   = int(len(data) / self._samplerate)
+        self._data          = data
+        self._samplerate    = int(sr)
+        self._channels      = data.shape[1] if data.ndim > 1 else 1
+        self._path          = path
+        self._duration      = int(len(data) / self._samplerate)
         with self._lock:
             self._cursor = 0
         self.sig_dur.emit(self._duration)
@@ -380,11 +465,12 @@ class AudioEngine(QObject):
         )
         if self._device is not None:
             kwargs['device'] = self._device
+        if self._pw_node:
+            os.environ['PIPEWIRE_NODE'] = self._pw_node
         try:
             self._stream = sd.OutputStream(**kwargs)
             self._stream.start()
         except Exception as e:
-            # Fallback: abre sem dispositivo específico (usa padrão do sistema)
             print(f"AudioEngine: dispositivo {self._device} falhou ({e}), usando padrão")
             try:
                 kwargs.pop('device', None)
@@ -393,6 +479,8 @@ class AudioEngine(QObject):
             except Exception as e2:
                 print(f"AudioEngine stream error: {e2}")
                 self._stream = None
+        finally:
+            os.environ.pop('PIPEWIRE_NODE', None)
 
     def _close_stream(self):
         if self._stream is not None:
@@ -407,11 +495,12 @@ class AudioEngine(QObject):
         if self._state != 'playing' or self._data is None:
             outdata[:] = 0
             return
+        data = self._data
         with self._lock:
             start = self._cursor
             end   = start + frames
-            chunk = self._data[start:end]
-            self._cursor = min(end, len(self._data))
+            chunk = data[start:end]
+            self._cursor = min(end, len(data))
         n = len(chunk)
         if n < frames:
             outdata[:n] = chunk * self._volume
@@ -478,6 +567,7 @@ class CueEngine(QObject):
         self._lock      = threading.Lock()
         self._stream    = None
         self._device    = None   # None = default
+        self._pw_node   = None
 
         self._pos_timer = QTimer()
         self._pos_timer.setInterval(50)
@@ -490,10 +580,12 @@ class CueEngine(QObject):
 
     def set_device(self, name: str):
         if not name or name == 'Dispositivo padrão':
-            self._device = None
+            self._device  = None
+            self._pw_node = None
         else:
             pairs = _sd_output_devices()
-            self._device = next((idx for n, idx in pairs if n == name), None)
+            self._device  = next((idx for n, idx in pairs if n == name), None)
+            self._pw_node = _PW_NODE_MAP.get(name)
 
     def load(self, path: str) -> bool:
         self.stop()
@@ -519,11 +611,11 @@ class CueEngine(QObject):
                 print(f"CueEngine: não foi possível carregar audio: {e2}")
         if data is None:
             return False
-        self._data       = data
-        self._samplerate = int(sr)
-        self._channels   = data.shape[1] if data.ndim > 1 else 1
-        self._path       = path
-        self._duration   = int(len(data) / self._samplerate)
+        self._data          = data
+        self._samplerate    = int(sr)
+        self._channels      = data.shape[1] if data.ndim > 1 else 1
+        self._path          = path
+        self._duration      = int(len(data) / self._samplerate)
         with self._lock:
             self._cursor = 0
         self.sig_dur.emit(self._duration)
@@ -589,7 +681,7 @@ class CueEngine(QObject):
         if self._state != 'playing':
             self._state = 'playing'
             self.sig_state.emit('playing')
-            if self._stream is None:          # only open stream if truly closed
+            if self._stream is None:
                 self._start_stream()
 
     def set_volume(self, v: float):
@@ -600,21 +692,25 @@ class CueEngine(QObject):
         self._close_stream()
         if not HAS_SD or self._data is None:
             return
+        kwargs = dict(
+            samplerate=self._samplerate,
+            channels=self._channels,
+            dtype='float32',
+            callback=self._callback,
+            finished_callback=self._on_finished,
+        )
+        if self._device is not None:
+            kwargs['device'] = self._device
+        if self._pw_node:
+            os.environ['PIPEWIRE_NODE'] = self._pw_node
         try:
-            kwargs = dict(
-                samplerate=self._samplerate,
-                channels=self._channels,
-                dtype='float32',
-                callback=self._callback,
-                finished_callback=self._on_finished,
-            )
-            if self._device is not None:
-                kwargs['device'] = self._device
             self._stream = sd.OutputStream(**kwargs)
             self._stream.start()
         except Exception as e:
             print(f"CueEngine stream error: {e}")
             self._stream = None
+        finally:
+            os.environ.pop('PIPEWIRE_NODE', None)
 
     def _close_stream(self):
         if self._stream is not None:
@@ -629,12 +725,12 @@ class CueEngine(QObject):
         if self._state != 'playing' or self._data is None:
             outdata[:] = 0
             return
+        data = self._data
         with self._lock:
             start = self._cursor
             end   = start + frames
-            chunk = self._data[start:end]
-            self._cursor = min(end, len(self._data))
-
+            chunk = data[start:end]
+            self._cursor = min(end, len(data))
         n = len(chunk)
         if n < frames:
             outdata[:n]  = chunk * self._volume
@@ -643,7 +739,6 @@ class CueEngine(QObject):
             outdata[:] = chunk * self._volume
 
     def _on_finished(self):
-        # Called from sounddevice thread when stream finishes
         if self._state == 'playing':
             self._state = 'stopped'
             with self._lock:
