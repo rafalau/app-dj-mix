@@ -106,6 +106,29 @@ PLAYED_PATHS: set[str]        = set()  # paths que já foram tocados
 _MUSIC_FOLDER: str            = ''   # pasta padrão para diálogos de arquivo
 
 
+def _sd_output_devices() -> list[tuple[str, int]]:
+    """Retorna (nome, índice_sd) de dispositivos de saída.
+    Usa DirectSound no Windows (faz resampling automático, sem conflito de taxa).
+    Fallback para WASAPI, depois qualquer output."""
+    if not HAS_SD:
+        return []
+    try:
+        apis = sd.query_hostapis()
+        # DirectSound: resampling automático, sem modo exclusivo, ideal para DJ
+        ds_idx     = next((i for i, a in enumerate(apis) if 'DirectSound' in a['name']), None)
+        wasapi_idx = next((i for i, a in enumerate(apis) if 'WASAPI'      in a['name']), None)
+        target_api = ds_idx if ds_idx is not None else wasapi_idx
+        devs = sd.query_devices()
+        result = []
+        for i, d in enumerate(devs):
+            if d['max_output_channels'] > 0:
+                if target_api is None or d['hostapi'] == target_api:
+                    result.append((d['name'], i))
+        return result
+    except Exception:
+        return []
+
+
 def _cue_slots(path: str) -> list:
     if path not in CUE_POINTS:
         CUE_POINTS[path] = [None] * 5
@@ -203,25 +226,27 @@ def display_name(path: str) -> str:
 
 # ── Audio Engine ──────────────────────────────────────────────────────────────
 class AudioEngine(QObject):
-    sig_pos     = pyqtSignal(float)   # 0.0–1.0
-    sig_state   = pyqtSignal(str)     # playing / paused / stopped
-    sig_dur     = pyqtSignal(int)     # seconds
+    sig_pos     = pyqtSignal(float)
+    sig_state   = pyqtSignal(str)
+    sig_dur     = pyqtSignal(int)
     sig_vu      = pyqtSignal(float, float)
     sig_ended   = pyqtSignal()
 
     def __init__(self):
         super().__init__()
-        self._path      = None
-        self._state     = 'stopped'
-        self._duration  = 0
-        self._t0        = 0.0
-        self._offset    = 0.0
-        self._volume    = 0.8
-        self._vu_l      = 0.0
-        self._vu_r      = 0.0
-        self._vu_peak_l = 0.0
-        self._vu_peak_r = 0.0
-        self._peak_hold = 0
+        self._path       = None
+        self._data       = None    # numpy float32 array (frames × channels)
+        self._samplerate = 44100
+        self._channels   = 2
+        self._state      = 'stopped'
+        self._duration   = 0
+        self._volume     = 0.8
+        self._cursor     = 0
+        self._lock       = threading.Lock()
+        self._stream     = None
+        self._device     = None    # None = dispositivo padrão do sistema
+        self._vu_l       = 0.0
+        self._vu_r       = 0.0
 
         self._tick_timer = QTimer()
         self._tick_timer.setInterval(40)
@@ -229,117 +254,184 @@ class AudioEngine(QObject):
         self._tick_timer.start()
 
     # ── public API ─────────────────────────────────────────────────────────
+    def get_devices(self) -> list[str]:
+        return [name for name, _ in _sd_output_devices()]
+
+    def set_device(self, name: str):
+        if not name or name == 'Dispositivo padrão':
+            new_idx = None
+        else:
+            pairs   = _sd_output_devices()
+            new_idx = next((idx for n, idx in pairs if n == name), None)
+        if new_idx == self._device:
+            return
+        self._device = new_idx
+        if self._state in ('playing', 'paused'):
+            was_playing = self._state == 'playing'
+            self._close_stream()
+            self._start_stream()
+            if not was_playing:
+                self._state = 'paused'
+                self.sig_state.emit('paused')
+
     def load(self, path: str) -> bool:
-        self._path = None
-        self._duration = 0
-        if HAS_PYGAME:
+        self.stop()
+        data, sr = None, 44100
+        if HAS_SF:
             try:
-                pygame.mixer.music.load(path)
-                self._path = path
-                if HAS_MUTAGEN:
-                    f = MutagenFile(path)
-                    if f and hasattr(f.info, 'length'):
-                        self._duration = int(f.info.length)
-                self.sig_dur.emit(self._duration)
-                return True
+                data, sr = sf.read(path, dtype='float32', always_2d=True)
+            except Exception:
+                pass
+        if data is None and HAS_PYGAME:
+            try:
+                import numpy as np
+                sound = pygame.mixer.Sound(path)
+                arr   = pygame.sndarray.array(sound)
+                arr   = arr.astype('float32') / 32768.0
+                if arr.ndim == 1:
+                    arr = arr.reshape(-1, 1)
+                data = arr
+                sr   = pygame.mixer.get_init()[0] or 44100
             except Exception as e:
-                self.sig_state.emit('stopped')
-                raise RuntimeError(str(e))
-        return False
+                print(f"AudioEngine fallback load error: {e}")
+        if data is None:
+            self.sig_state.emit('stopped')
+            raise RuntimeError(f"Não foi possível carregar: {path}")
+        self._data       = data
+        self._samplerate = int(sr)
+        self._channels   = data.shape[1] if data.ndim > 1 else 1
+        self._path       = path
+        self._duration   = int(len(data) / self._samplerate)
+        with self._lock:
+            self._cursor = 0
+        self.sig_dur.emit(self._duration)
+        return True
 
     def play(self):
-        if not self._path:
+        if self._data is None:
             return
-        if HAS_PYGAME:
-            try:
-                if self._state == 'paused':
-                    pygame.mixer.music.unpause()
-                    self._t0 = time.time()
-                else:
-                    pygame.mixer.music.play()
-                    self._t0 = time.time()
-                    self._offset = 0.0
-                self._state = 'playing'
-                self.sig_state.emit('playing')
-            except Exception as e:
-                print(f"play error: {e}")
-                self._state = 'stopped'
-                self.sig_state.emit('stopped')
+        if self._state == 'paused':
+            self._state = 'playing'
+            self.sig_state.emit('playing')
+            return
+        if self._state == 'playing':
+            return
+        self._start_stream()
+        self._state = 'playing'
+        self.sig_state.emit('playing')
 
     def pause(self):
-        if HAS_PYGAME and self._state == 'playing':
-            pygame.mixer.music.pause()
-            self._offset += time.time() - self._t0
+        if self._state == 'playing':
             self._state = 'paused'
             self.sig_state.emit('paused')
 
     def stop(self):
-        if HAS_PYGAME:
-            pygame.mixer.music.stop()
         self._state = 'stopped'
-        self._offset = 0.0
+        self._close_stream()
+        with self._lock:
+            self._cursor = 0
         self.sig_state.emit('stopped')
         self.sig_pos.emit(0.0)
 
     def seek(self, pos: float):
-        if HAS_PYGAME and self._duration > 0 and self._path:
-            target = pos * self._duration
-            try:
-                was_playing = self._state == 'playing'
-                pygame.mixer.music.play(start=target)
-                self._offset = target
-                self._t0 = time.time()
-                if not was_playing:
-                    pygame.mixer.music.pause()
-                    self._state = 'paused'
-                else:
-                    self._state = 'playing'
-            except Exception as e:
-                print(f"seek error: {e}")
+        if self._data is None:
+            return
+        new_cursor = int(max(0.0, min(1.0, pos)) * len(self._data))
+        was_playing = self._state == 'playing'
+        if was_playing:
+            self._close_stream()
+        with self._lock:
+            self._cursor = new_cursor
+        if was_playing:
+            self._start_stream()
+            self._state = 'playing'
+            self.sig_state.emit('playing')
 
     def set_volume(self, v: float):
         self._volume = max(0.0, min(1.0, v))
-        if HAS_PYGAME:
-            pygame.mixer.music.set_volume(self._volume)
 
     def pos_seconds(self) -> int:
-        if self._duration == 0:
+        if self._duration == 0 or self._data is None:
             return 0
-        return int(self._pos_frac() * self._duration)
+        with self._lock:
+            cursor = self._cursor
+        return int(cursor / self._samplerate)
 
     @property
     def state(self): return self._state
-
-    def get_devices(self) -> list:
-        if HAS_SD:
-            try:
-                return [d['name'] for d in sd.query_devices()
-                        if d['max_output_channels'] > 0]
-            except Exception:
-                pass
-        return ['Dispositivo padrão']
+    @property
+    def duration(self): return self._duration
 
     # ── internal ───────────────────────────────────────────────────────────
-    def _pos_frac(self) -> float:
-        if self._duration == 0:
-            return 0.0
-        if self._state == 'playing':
-            elapsed = self._offset + (time.time() - self._t0)
-        elif self._state == 'paused':
-            elapsed = self._offset
+    def _start_stream(self):
+        self._close_stream()
+        if not HAS_SD or self._data is None:
+            return
+        kwargs = dict(
+            samplerate=self._samplerate,
+            channels=self._channels,
+            dtype='float32',
+            callback=self._callback,
+            finished_callback=self._on_finished,
+        )
+        if self._device is not None:
+            kwargs['device'] = self._device
+        try:
+            self._stream = sd.OutputStream(**kwargs)
+            self._stream.start()
+        except Exception as e:
+            # Fallback: abre sem dispositivo específico (usa padrão do sistema)
+            print(f"AudioEngine: dispositivo {self._device} falhou ({e}), usando padrão")
+            try:
+                kwargs.pop('device', None)
+                self._stream = sd.OutputStream(**kwargs)
+                self._stream.start()
+            except Exception as e2:
+                print(f"AudioEngine stream error: {e2}")
+                self._stream = None
+
+    def _close_stream(self):
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+
+    def _callback(self, outdata, frames, time_info, status):
+        if self._state != 'playing' or self._data is None:
+            outdata[:] = 0
+            return
+        with self._lock:
+            start = self._cursor
+            end   = start + frames
+            chunk = self._data[start:end]
+            self._cursor = min(end, len(self._data))
+        n = len(chunk)
+        if n < frames:
+            outdata[:n] = chunk * self._volume
+            outdata[n:] = 0
         else:
+            outdata[:] = chunk * self._volume
+
+    def _on_finished(self):
+        if self._state == 'playing':
+            self._state = 'stopped'
+            with self._lock:
+                self._cursor = 0
+            self.sig_state.emit('stopped')
+            self.sig_ended.emit()
+
+    def _pos_frac(self) -> float:
+        if self._duration == 0 or self._data is None:
             return 0.0
-        return min(1.0, elapsed / self._duration)
+        with self._lock:
+            cursor = self._cursor
+        return min(1.0, cursor / len(self._data))
 
     def _tick(self):
         if self._state == 'playing':
-            if HAS_PYGAME and not pygame.mixer.music.get_busy():
-                self._state = 'stopped'
-                self._offset = 0.0
-                self.sig_state.emit('stopped')
-                self.sig_ended.emit()
-                self._decay_vu()
-                return
             self.sig_pos.emit(self._pos_frac())
             self._animate_vu()
         else:
@@ -348,8 +440,8 @@ class AudioEngine(QObject):
     def _animate_vu(self):
         t = time.time()
         base = 0.55 + 0.30 * abs(
-            0.5 * (1 + __import__('math').sin(t * 4.1)) *
-            (0.7 + 0.3 * __import__('math').sin(t * 7.3))
+            0.5 * (1 + math.sin(t * 4.1)) *
+            (0.7 + 0.3 * math.sin(t * 7.3))
         )
         self._vu_l = max(0.0, min(1.0, base + random.gauss(0, 0.07)))
         self._vu_r = max(0.0, min(1.0, base + random.gauss(0, 0.07)))
@@ -360,11 +452,6 @@ class AudioEngine(QObject):
             self._vu_l *= 0.82
             self._vu_r *= 0.82
             self.sig_vu.emit(self._vu_l, self._vu_r)
-
-    @property
-    def state(self): return self._state
-    @property
-    def duration(self): return self._duration
 
 
 # ── CUE Engine ────────────────────────────────────────────────────────────────
@@ -394,17 +481,15 @@ class CueEngine(QObject):
         self._pos_timer.start()
 
     # ── public API ─────────────────────────────────────────────────────────
-    def get_devices(self) -> list:
-        if HAS_SD:
-            try:
-                return [d['name'] for d in sd.query_devices()
-                        if d['max_output_channels'] > 0]
-            except Exception:
-                pass
-        return ['Dispositivo padrão']
+    def get_devices(self) -> list[str]:
+        return [name for name, _ in _sd_output_devices()]
 
     def set_device(self, name: str):
-        self._device = name if name and name != 'Dispositivo padrão' else None
+        if not name or name == 'Dispositivo padrão':
+            self._device = None
+        else:
+            pairs = _sd_output_devices()
+            self._device = next((idx for n, idx in pairs if n == name), None)
 
     def load(self, path: str) -> bool:
         self.stop()
@@ -4087,6 +4172,8 @@ class MainWindow(QMainWindow):
             self._cue_device   = ''
             self._music_folder = ''
             _MUSIC_FOLDER      = ''
+            self._engine.set_device('')
+            self._cue_engine.set_device('')
             try: self._refresh_search_btn()
             except Exception as e: print(f"reset/search_btn: {e}")
 
@@ -4133,6 +4220,7 @@ class MainWindow(QMainWindow):
             self._main_device  = dlg.main_device()
             self._cue_device   = dlg.cue_device()
             new_folder         = dlg.music_folder()
+            self._engine.set_device(self._main_device)
             self._cue_engine.set_device(self._cue_device)
             if new_folder != self._music_folder:
                 global _MUSIC_FOLDER
@@ -4407,6 +4495,8 @@ class MainWindow(QMainWindow):
             self._music_folder = settings.get('music_folder', '')
             global _MUSIC_FOLDER
             _MUSIC_FOLDER      = self._music_folder
+            if self._main_device:
+                self._engine.set_device(self._main_device)
             if self._cue_device:
                 self._cue_engine.set_device(self._cue_device)
             self._refresh_search_btn()
