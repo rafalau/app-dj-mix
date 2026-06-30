@@ -3,7 +3,7 @@
 ; Compilar: iscc installer\DJMixPlayer.iss
 
 #define MyAppName      "DJ Mix Player"
-#define MyAppVersion   "1.0.3"
+#define MyAppVersion   "1.0.4"
 #define MyAppPublisher "Rafael Lauriano"
 #define MyAppURL       "https://github.com/rafalau/app-dj-mix"
 #define MyAppExeName   "DJMixPlayer.exe"
