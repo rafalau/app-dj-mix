@@ -2945,6 +2945,7 @@ class SettingsDialog(QDialog):
         self.setModal(True)
         self.setFixedSize(520, 340)
         self._reset_played = False
+        self._reset_all    = False
         self.setStyleSheet(f"background:{C['bg']};color:{C['text']};")
         _combo_style = f"""
             QComboBox{{
@@ -3041,6 +3042,17 @@ class SettingsDialog(QDialog):
         btn_reset_played.clicked.connect(self._do_reset_played)
         root.addWidget(btn_reset_played)
 
+        btn_reset_all = QPushButton('⚠  RESETAR CONFIGURAÇÕES — Apagar tudo e voltar ao zero')
+        btn_reset_all.setFixedHeight(34)
+        btn_reset_all.setStyleSheet(f"""
+            QPushButton{{background:#2a0a0a;color:#ff4444;
+                border:1px solid #8b0000;border-radius:5px;
+                font-size:11px;font-weight:bold;letter-spacing:0.5px;}}
+            QPushButton:hover{{background:#400000;border-color:#ff4444;}}
+        """)
+        btn_reset_all.clicked.connect(self._do_reset_all)
+        root.addWidget(btn_reset_all)
+
         _btn_style_cancel = f"""
             QPushButton{{background:{C['panel']};color:{C['text']};
                 border:1px solid {C['border2']};border-radius:5px;
@@ -3086,6 +3098,31 @@ class SettingsDialog(QDialog):
         """)
         if msg.exec() == QMessageBox.StandardButton.Yes:
             self._reset_played = True
+
+    def _do_reset_all(self):
+        msg = QMessageBox(self)
+        msg.setWindowTitle('Resetar tudo')
+        msg.setText(
+            'Isso vai apagar TODAS as playlists, músicas, slots de sonoplastia,\n'
+            'configurações de dispositivos e histórico de tocadas.\n\n'
+            'Não há como desfazer. Continuar?'
+        )
+        msg.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        msg.setDefaultButton(QMessageBox.StandardButton.No)
+        msg.setStyleSheet(f"""
+            QMessageBox{{background:{C['bg']};color:{C['text']};}}
+            QLabel{{color:{C['text']};font-size:13px;}}
+            QPushButton{{background:{C['panel']};color:{C['text']};
+                border:1px solid {C['border2']};border-radius:5px;
+                font-size:12px;padding:5px 18px;min-width:70px;}}
+            QPushButton:hover{{background:{C['hover']};border-color:{C['accent_lt']};}}
+            QPushButton[text="Yes"]{{background:#8b0000;color:#fff;border:none;font-weight:bold;}}
+            QPushButton:default{{background:#8b0000;color:#fff;border:none;font-weight:bold;}}
+        """)
+        if msg.exec() == QMessageBox.StandardButton.Yes:
+            self._reset_all = True
+            self.accept()
 
     def _browse_folder(self):
         folder = QFileDialog.getExistingDirectory(self, 'Selecionar pasta de músicas',
@@ -3805,6 +3842,49 @@ class MainWindow(QMainWindow):
             pg.set_playing(None)
         self._refresh_cue_buttons()
 
+    def _do_full_reset(self):
+        # Para tudo que estiver tocando
+        self._engine.stop()
+        self._cue_engine.stop()
+        if self._sfx_engine.active_idx is not None:
+            self._sfx_fade_timer.stop()
+            self._sfx_restore_timer.stop()
+            self._sfx_engine.stop()
+
+        # Limpa playlists e painéis
+        for pg in self._pages:
+            for panel in pg.get_panels():
+                panel.clear_data()
+
+        # Reseta slots de sonoplastia
+        for i in range(50):
+            self._sfx_engine.set_slot(i, None)
+        for btn in self._sfx_btns:
+            btn.setText('')
+            btn.setToolTip('')
+            btn.setStyleSheet(self._sfx_btn_style(None))
+
+        # Reseta configurações
+        self._main_device  = ''
+        self._cue_device   = ''
+        self._music_folder = ''
+        self._refresh_search_btn()
+
+        # Reseta histórico de tocadas
+        PLAYED_PATHS.clear()
+        for pg in self._pages:
+            for panel in pg.get_panels():
+                panel._list.viewport().update()
+
+        # Reseta CUE points
+        CUE_POINTS.clear()
+        CUE_FADEIN.clear()
+
+        # Deleta arquivo de save e salva estado limpo
+        if DATA_FILE.exists():
+            DATA_FILE.unlink()
+        self._save()
+
     def _open_settings(self):
         dlg = SettingsDialog(
             devices=self._cue_engine.get_devices(),
@@ -3814,6 +3894,9 @@ class MainWindow(QMainWindow):
             parent=self,
         )
         dlg.exec()
+        if dlg._reset_all:
+            self._do_full_reset()
+            return
         if dlg._reset_played:
             PLAYED_PATHS.clear()
             for pg in self._pages:
