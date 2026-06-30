@@ -45,6 +45,14 @@ echo "[4/5] Preparando arquivos para o Flatpak..."
 cp -r dist/DJMixPlayer            "$FLATPAK_DIR/DJMixPlayer"
 cp assets/icon_256.png            "$FLATPAK_DIR/icon_256.png"
 
+# Inclui pw-dump no bundle para que o Flatpak enumere dispositivos via PipeWire
+# (o socket /run/user/*/pipewire-0 é acessível via --filesystem=xdg-run/pipewire-0)
+if [ -x "/usr/bin/pw-dump" ]; then
+    cp /usr/bin/pw-dump "$FLATPAK_DIR/DJMixPlayer/_internal/pw-dump"
+    chmod +x "$FLATPAK_DIR/DJMixPlayer/_internal/pw-dump"
+    echo "   pw-dump bundled OK"
+fi
+
 # ── 5. Build do Flatpak ──────────────────────────────────────────────────────
 echo "[5/5] Construindo Flatpak..."
 flatpak-builder \

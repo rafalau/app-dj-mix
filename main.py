@@ -165,7 +165,12 @@ def _linux_pw_output_devices() -> list[tuple[str, int]]:
     try:
         import subprocess, re
         from collections import Counter
-        data = json.loads(subprocess.check_output(['pw-dump'], stderr=subprocess.DEVNULL, timeout=3))
+        pw_dump_cmd = 'pw-dump'
+        if hasattr(sys, '_MEIPASS'):
+            _bundled = os.path.join(sys._MEIPASS, 'pw-dump')
+            if os.path.isfile(_bundled):
+                pw_dump_cmd = _bundled
+        data = json.loads(subprocess.check_output([pw_dump_cmd], stderr=subprocess.DEVNULL, timeout=3))
 
         # Device 'pipewire' do sounddevice (ALSA virtual que roteia pelo PipeWire)
         pipewire_idx = next(

@@ -43,34 +43,3 @@ def _patched_find_library(name):
     return None
 
 _ctutil.find_library = _patched_find_library
-
-# ── Debug log (Flatpak) ───────────────────────────────────────────────────────
-try:
-    _log = os.path.join(os.path.expanduser('~'), 'djmix_debug.log')
-    with open(_log, 'w') as _f:
-        _f.write(f'lib_dir: {_lib_dir}\n')
-        _f.write(f'find_library(portaudio): {_patched_find_library("portaudio")}\n')
-        _f.write(f'find_library(pulse): {_patched_find_library("pulse")}\n')
-        try:
-            import pulsectl
-            _f.write('pulsectl: importado OK\n')
-            with pulsectl.Pulse('djmix-debug') as _p:
-                _sinks = _p.sink_list()
-                _f.write(f'pulsectl sinks ({len(_sinks)}):\n')
-                for _s in _sinks:
-                    _f.write(f'  {_s.name} | {_s.description}\n')
-                    for _port in _s.port_list:
-                        _f.write(f'    port: {_port.description} | avail={_port.available}\n')
-        except Exception as _e:
-            _f.write(f'pulsectl ERRO: {_e}\n')
-        try:
-            import sounddevice as _sd
-            _devs = list(_sd.query_devices())
-            _f.write(f'sd.query_devices ({len(_devs)}):\n')
-            for _i, _d in enumerate(_devs):
-                if _d['max_output_channels'] > 0:
-                    _f.write(f'  [{_i}] {_d["name"]} (out={_d["max_output_channels"]})\n')
-        except Exception as _e:
-            _f.write(f'sd.query_devices ERRO: {_e}\n')
-except Exception:
-    pass

@@ -8,9 +8,10 @@ finish-args:
   - --share=ipc
   - --socket=fallback-x11
   - --socket=wayland
-  - --socket=pulseaudio      # PipeWire via compat PulseAudio
-  - --filesystem=home        # acesso à biblioteca musical
-  - --device=dri             # aceleração GPU para Qt
+  - --socket=pulseaudio         # PipeWire via compat PulseAudio
+  - --filesystem=home           # acesso à biblioteca musical
+  - --device=dri                # aceleração GPU para Qt
+  - --filesystem=xdg-run/pipewire-0  # socket nativo PipeWire (pw-dump)
 
 modules:
   - name: djmixplayer
