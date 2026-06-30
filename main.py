@@ -164,7 +164,6 @@ def display_name(path: str) -> str:
         sl = s.strip().lower()
         if sl in _GENERIC:
             return True
-        # "track 1", "faixa 01", "track01", etc.
         if _re.fullmatch(r'(track|faixa|pista|titre)\s*\d+', sl):
             return True
         return False
@@ -3030,6 +3029,34 @@ class _FlatBtn(QPushButton):
         p.end()
 
 
+class _SFXBtn(QPushButton):
+    """Botão de slot de sonoplastia com suporte a drag & drop de áudio."""
+    sig_drop = pyqtSignal(int, str)   # (local_idx, path)
+
+    def __init__(self, local_idx: int, parent=None):
+        super().__init__(parent)
+        self._local_idx = local_idx
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, ev):
+        urls = ev.mimeData().urls()
+        if urls and Path(urls[0].toLocalFile()).suffix.lower() in AUDIO_EXTENSIONS:
+            ev.acceptProposedAction()
+        else:
+            ev.ignore()
+
+    def dragMoveEvent(self, ev):
+        ev.acceptProposedAction()
+
+    def dropEvent(self, ev):
+        urls = ev.mimeData().urls()
+        if urls:
+            path = urls[0].toLocalFile()
+            if Path(path).suffix.lower() in AUDIO_EXTENSIONS:
+                self.sig_drop.emit(self._local_idx, path)
+                ev.acceptProposedAction()
+
+
 class SettingsDialog(QDialog):
     def __init__(self, devices: list, main_device: str, cue_device: str,
                  music_folder: str = '', parent=None):
@@ -3630,7 +3657,8 @@ class MainWindow(QMainWindow):
         sfx_grid.setContentsMargins(0, 0, 0, 0)
         self._sfx_btns = []
         for i in range(10):
-            btn = QPushButton(f'{i}\n— vazio —')
+            btn = _SFXBtn(i)
+            btn.setText(f'{i}\n— vazio —')
             btn.setFixedHeight(38)
             btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             btn.setStyleSheet(self._sfx_btn_style(None))
@@ -3638,6 +3666,7 @@ class MainWindow(QMainWindow):
             btn.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             btn.customContextMenuRequested.connect(
                 lambda pos, idx=i, b=btn: self._sfx_ctx(idx, b))
+            btn.sig_drop.connect(self._sfx_drop)
             self._sfx_btns.append(btn)
             sfx_grid.addWidget(btn, i // 5, i % 5)
         vu_root.addLayout(sfx_grid)
@@ -4123,7 +4152,7 @@ class MainWindow(QMainWindow):
         path    = self._sfx_engine.get_slot(abs_idx)
         playing = (self._sfx_engine.active_idx == abs_idx)
         btn     = self._sfx_btns[local]
-        name    = display_name(path) if path else '— vazio —'
+        name    = Path(path).stem if path else '— vazio —'
         if len(name) > 14:
             name = name[:13] + '…'
         btn.setText(f'{local}\n{name}')
@@ -4151,6 +4180,10 @@ class MainWindow(QMainWindow):
                 self._sfx_set_slot(abs_idx, path)
         elif action == a_clear:
             self._sfx_set_slot(abs_idx, None)
+
+    def _sfx_drop(self, local_idx: int, path: str):
+        abs_idx = self._sfx_page * 10 + local_idx
+        self._sfx_set_slot(abs_idx, path)
 
     def _sfx_set_slot(self, idx: int, path: str | None):
         self._sfx_engine.set_slot(idx, path)
