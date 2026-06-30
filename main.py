@@ -69,7 +69,28 @@ _backends_ready = threading.Event()
 
 def _load_backends():
     """Carrega sounddevice, soundfile e mutagen em background para não travar a abertura."""
-    global sd, sf, MutagenFile, HAS_SD, HAS_SF, HAS_MUTAGEN, HAS_FFMPEG
+    global sd, sf, MutagenFile, HAS_SD, HAS_SF, HAS_MUTAGEN, HAS_FFMPEG, _pa_sinks_early
+    # Coleta sinks PulseAudio ANTES de inicializar o PortAudio — pulsectl funciona
+    # mesmo no Flatpak pois usa o socket PulseAudio, mas pode falhar depois que o
+    # PortAudio abre sua própria conexão PA.
+    if sys.platform != 'win32':
+        try:
+            import pulsectl as _pulsectl
+            from collections import Counter as _Counter
+            with _pulsectl.Pulse('djmix-early') as _pulse:
+                _sinks = _pulse.sink_list()
+                _raw = []
+                for _sink in _sinks:
+                    _avail = [p for p in _sink.port_list if str(p.available) != 'no']
+                    _raw.append(_avail[0].description if len(_avail) == 1 else _sink.description)
+                _count = _Counter(_raw)
+                for _sink, _desc in zip(_sinks, _raw):
+                    _display = (f'{_desc} – {_sink.description.split()[0]}'
+                                if _count[_desc] > 1 else _desc)
+                    _pa_sinks_early.append((_display, _sink.name))
+                    _PW_NODE_MAP[_display] = _sink.name
+        except Exception:
+            pass
     try:
         import sounddevice as _sd
         sd    = _sd
@@ -156,6 +177,10 @@ _MUSIC_FOLDER: str            = ''   # pasta padrão para diálogos de arquivo
 # display_name → PipeWire node.name (para roteamento via PIPEWIRE_NODE)
 _PW_NODE_MAP: dict[str, str] = {}
 
+# Cache de sinks PulseAudio coletados ANTES do sounddevice/PortAudio inicializar
+# [(display_name, sink_name), ...]
+_pa_sinks_early: list[tuple[str, str]] = []
+
 
 def _linux_pw_output_devices() -> list[tuple[str, int]]:
     """No Linux, usa EnumRoute do PipeWire com device 'pipewire' para roteamento correto.
@@ -241,14 +266,12 @@ def _linux_pw_output_devices() -> list[tuple[str, int]]:
 
 
 def _linux_pactl_output_devices() -> list[tuple[str, int]]:
-    """Fallback via pulsectl quando pw-dump não está disponível (Flatpak).
-    Usa libpulse via ctypes — acessa PipeWire pelo socket PulseAudio.
-    Nomes de porta (ex.: 'HDMI / DisplayPort') coincidem com os do pw-dump."""
+    """Fallback via pulsectl.
+    Usa o cache _pa_sinks_early coletado antes do PortAudio inicializar (mais confiável).
+    Se o cache estiver vazio, tenta pulsectl ao vivo."""
     global _PW_NODE_MAP
     try:
-        import pulsectl
-        from collections import Counter as _Counter
-        # No Flatpak não existe device 'pipewire'; usa 'pulse' ou 'default'
+        # sounddevice index para 'pulse' ou 'default'
         devs_enum = list(enumerate(sd.query_devices()))
         pa_idx = None
         for _hint in ('pipewire', 'pulse', 'default'):
@@ -259,8 +282,13 @@ def _linux_pactl_output_devices() -> list[tuple[str, int]]:
             )
             if pa_idx is not None:
                 break
+        # Cache coletado antes do PortAudio init — é a fonte mais confiável no Flatpak
+        if _pa_sinks_early and pa_idx is not None:
+            return [(name, pa_idx) for name, _ in _pa_sinks_early]
         if pa_idx is None:
             return []
+        import pulsectl
+        from collections import Counter as _Counter
         _PW_NODE_MAP = {}
         result = []
         with pulsectl.Pulse('djmix-enum') as pulse:
