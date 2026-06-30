@@ -43,11 +43,11 @@ where gh >nul 2>&1
 if errorlevel 1 (
     echo AVISO: gh CLI nao encontrado.
     echo        Instale em: https://cli.github.com
-    echo        Depois rode: gh release upload v1.0.6 dist\DJMixPlayer_Setup_v1.0.6.exe --repo rafalau/app-dj-mix --clobber
+    echo        Depois rode: gh release upload v1.0.7 dist\DJMixPlayer_Setup_v1.0.7.exe --repo rafalau/app-dj-mix --clobber
     goto :done
 )
 
-gh release upload v1.0.6 "dist\DJMixPlayer_Setup_v1.0.6.exe" --repo rafalau/app-dj-mix --clobber
+gh release upload v1.0.7 "dist\DJMixPlayer_Setup_v1.0.7.exe" --repo rafalau/app-dj-mix --clobber
 if errorlevel 1 ( echo ERRO no upload & pause & exit /b 1 )
 echo Upload concluido!
 
