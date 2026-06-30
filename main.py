@@ -2045,6 +2045,13 @@ class PlaylistPanel(QWidget):
     def to_dict(self) -> dict:
         return {'name': self._name, 'songs': list(self._songs), 'repeat': self._repeat}
 
+    def clear_data(self):
+        self._songs.clear()
+        self._list.clear()
+        self._repeat = 0
+        self._apply_repeat_style()
+        self._upd_count()
+
     def from_dict(self, d: dict):
         self._name = d.get('name', self._name)
         self._lbl.setText(self._name)
@@ -3646,14 +3653,38 @@ class MainWindow(QMainWindow):
                     }}
                 """)
 
+    @staticmethod
+    def _panel_seq(d: dict) -> int:
+        """Extrai número sequencial do nome 'PLAYLIST N'."""
+        import re
+        m = re.search(r'(\d+)', d.get('name', ''))
+        return int(m.group(1)) if m else 999999
+
+    def _all_panels_sorted(self) -> list[dict]:
+        """Coleta todos os painéis de todas as páginas, ordenados sequencialmente."""
+        panels = []
+        for page in self._pages:
+            panels.extend(page.to_dict())
+        panels.sort(key=self._panel_seq)
+        return panels
+
+    def _distribute_panels(self, all_panels: list[dict]):
+        """Redistribui painéis ordenados nas páginas atuais."""
+        per_page = self._grid_cols * self._grid_rows
+        for i, page in enumerate(self._pages):
+            for panel in page.get_panels():
+                panel.clear_data()
+            start = i * per_page
+            slice_ = all_panels[start : start + per_page]
+            if slice_:
+                page.from_dict(slice_)
+
     def _set_grid_layout(self, cols: int, rows: int):
         if cols == self._grid_cols and rows == self._grid_rows:
             return
 
-        # coleta TODOS os painéis em ordem linear (refluxo)
-        all_panels: list[dict] = []
-        for page in self._pages:
-            all_panels.extend(page.to_dict())
+        # coleta todos os painéis em ordem sequencial correta
+        all_panels = self._all_panels_sorted()
 
         cur_idx = self._stack.currentIndex()
 
@@ -3667,7 +3698,7 @@ class MainWindow(QMainWindow):
         self._grid_rows = rows
         per_page = cols * rows
 
-        # recria páginas e distribui painéis em ordem
+        # recria páginas e distribui painéis em sequência
         for i in range(8):
             page = TabPage(i, cols, rows)
             page.sig_play.connect(self._play)
@@ -4117,9 +4148,10 @@ class MainWindow(QMainWindow):
                 self._stack.setCurrentIndex(0)
                 self._update_tab_btns(0)
 
-            # carrega playlists nas páginas já com o layout correto
+            # carrega playlists e normaliza a ordem sequencial
             for i, pd in enumerate(playlists[:len(self._pages)]):
                 self._pages[i].from_dict(pd)
+            self._distribute_panels(self._all_panels_sorted())
 
         except Exception as e:
             print(f"load data: {e}")
