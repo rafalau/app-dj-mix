@@ -3042,13 +3042,14 @@ class LayoutDialog(QDialog):
 
 class _FlatBtn(QPushButton):
     """Botão flat padronizado com ícone geométrico.
-    kind: 'export' | 'import' | 'reset_played' | 'reset_all'
+    kind: 'export' | 'import' | 'reset_played' | 'reset_all' | 'update'
     """
     _THEMES = {
         'export':       ('#0d2a1a', '#163520', '#1a6632', '#00cc55', '#ccffdd'),
         'import':       ('#0d1a2a', '#132035', '#1a3366', '#4499ff', '#cce0ff'),
         'reset_played': ('#2a1e08', '#352510', '#664d00', '#ffaa22', '#fff0cc'),
         'reset_all':    ('#2a0a0a', '#380e0e', '#8b0000', '#ff4444', '#ffcccc'),
+        'update':       ('#0d1a2a', '#132035', '#1a3366', '#00ccff', '#ccf0ff'),
     }
 
     def __init__(self, kind: str, label: str, parent=None):
@@ -3110,6 +3111,17 @@ class _FlatBtn(QPushButton):
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QColor(icon_c))
             p.drawPolygon(QPoint(ix + 8, iy), QPoint(ix + 3, iy + 5), QPoint(ix + 13, iy + 5))
+        elif self._kind == 'update':
+            # seta circular dupla (sync/refresh)
+            from PyQt6.QtGui import QPainterPath
+            stroke = QPen(QColor(icon_c), 2)
+            stroke.setCapStyle(Qt.PenCapStyle.RoundCap)
+            p.setPen(stroke)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawArc(ix + 1, iy + 2, 13, 13, 60 * 16, -300 * 16)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(icon_c))
+            p.drawPolygon(QPoint(ix + 8, iy + 1), QPoint(ix + 3, iy + 5), QPoint(ix + 13, iy + 5))
         else:  # reset_all — ícone de lixeira
             p.drawRect(ix + 2, iy + 4, 12, 11)   # corpo
             p.drawRect(ix,     iy + 3,  16, 2)    # tampa
@@ -3278,6 +3290,13 @@ class SettingsDialog(QDialog):
         row2.addWidget(btn_reset_all)
         root.addLayout(row2)
 
+        row3 = QHBoxLayout()
+        row3.setSpacing(8)
+        btn_update = _FlatBtn('update', f'Verificar Atualização  (v{APP_VERSION})')
+        btn_update.clicked.connect(self._do_check_update)
+        row3.addWidget(btn_update)
+        root.addLayout(row3)
+
         _btn_style_cancel = f"""
             QPushButton{{background:{C['panel']};color:{C['text']};
                 border:1px solid {C['border2']};border-radius:5px;
@@ -3385,6 +3404,44 @@ class SettingsDialog(QDialog):
         if msg.exec() == QMessageBox.StandardButton.Yes:
             self._import_file = src
             self.accept()
+
+    def _do_check_update(self):
+        if not HAS_UPDATER:
+            QMessageBox.information(self, 'Atualização', 'Verificador não disponível.')
+            return
+        from updater import check_for_update
+        import webbrowser
+        self._update_btn_ref = self.sender()
+        if self._update_btn_ref:
+            self._update_btn_ref.setEnabled(False)
+            self._update_btn_ref.setText('Verificando...')  # não afeta o paintEvent mas desativa
+        def on_found(tag, dl_url, body):
+            if self._update_btn_ref:
+                self._update_btn_ref.setEnabled(True)
+            msg = QMessageBox(self)
+            msg.setWindowTitle('Atualização disponível!')
+            msg.setText(
+                f'<b>DJ Mix Player v{tag}</b> está disponível!<br>'
+                f'Versão atual: v{APP_VERSION}<br><br>'
+                f'Deseja abrir a página de download?'
+            )
+            if body:
+                msg.setDetailedText(body)
+            msg.setStandardButtons(
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            msg.setDefaultButton(QMessageBox.StandardButton.Yes)
+            msg.setStyleSheet(f"background:{C['panel']};color:{C['text']};")
+            if msg.exec() == QMessageBox.StandardButton.Yes:
+                webbrowser.open(dl_url)
+        def on_none():
+            if self._update_btn_ref:
+                self._update_btn_ref.setEnabled(True)
+            msg = QMessageBox(self)
+            msg.setWindowTitle('Atualização')
+            msg.setText(f'Você já está na versão mais recente (v{APP_VERSION}).')
+            msg.setStyleSheet(f"background:{C['panel']};color:{C['text']};")
+            msg.exec()
+        check_for_update(on_update_found=on_found, on_no_update=on_none)
 
     def _browse_folder(self):
         folder = QFileDialog.getExistingDirectory(self, 'Selecionar pasta de músicas',

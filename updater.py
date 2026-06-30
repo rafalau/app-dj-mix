@@ -32,7 +32,7 @@ def _fetch_latest() -> dict | None:
         return None
 
 
-def check_for_update(on_update_found: callable, on_no_update: callable | None = None):
+def check_for_update(on_update_found, on_no_update=None):
     """
     Chama on_update_found(tag, download_url, body) se houver versão nova.
     Executa em thread background — callbacks devem usar signal/slot para thread-safety.
