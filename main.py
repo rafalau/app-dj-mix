@@ -3924,16 +3924,22 @@ class SettingsDialog(QDialog):
             self.accept()
 
     def _do_export(self):
-        import shutil
-        if not DATA_FILE.exists():
-            QMessageBox.warning(self, 'Exportar', 'Nenhuma configuração salva para exportar.')
-            return
         dest, _ = QFileDialog.getSaveFileName(
             self, 'Exportar Configurações', 'djmix_backup.json',
             'JSON (*.json)')
-        if dest:
-            shutil.copy2(str(DATA_FILE), dest)
-            QMessageBox.information(self, 'Exportar', f'Configurações exportadas para:\n{dest}')
+        if not dest:
+            return
+        data = {}
+        if DATA_FILE.exists():
+            with open(DATA_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        data.setdefault('settings', {})
+        data['settings']['main_device']  = self.main_device()
+        data['settings']['cue_device']   = self.cue_device()
+        data['settings']['music_folder'] = self.music_folder()
+        with open(dest, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        QMessageBox.information(self, 'Exportar', f'Configurações exportadas para:\n{dest}')
 
     def _do_import(self):
         src, _ = QFileDialog.getOpenFileName(
