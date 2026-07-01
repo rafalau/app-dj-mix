@@ -3724,11 +3724,12 @@ class SettingsDialog(QDialog):
     _sig_no_update    = pyqtSignal()
 
     def __init__(self, devices: list, main_device: str, cue_device: str,
-                 music_folder: str = '', parent=None):
+                 music_folder: str = '', save_callback=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle('Configurações')
         self.setModal(True)
         self.setFixedSize(520, 420)
+        self._save_callback  = save_callback
         self._reset_played   = False
         self._reset_all      = False
         self._import_file    = ''
@@ -3929,6 +3930,8 @@ class SettingsDialog(QDialog):
             'JSON (*.json)')
         if not dest:
             return
+        if self._save_callback:
+            self._save_callback()
         data = {}
         if DATA_FILE.exists():
             with open(DATA_FILE, 'r', encoding='utf-8') as f:
@@ -5000,6 +5003,7 @@ class MainWindow(QMainWindow):
             main_device=self._main_device,
             cue_device=self._cue_device,
             music_folder=self._music_folder,
+            save_callback=self._save,
             parent=self,
         )
         dlg.exec()
