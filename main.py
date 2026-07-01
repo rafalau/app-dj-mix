@@ -560,18 +560,19 @@ class AudioEngine(QObject):
         return [name for name, _ in _sd_output_devices()]
 
     def set_device(self, name: str):
+        old_idx     = self._device
+        old_pw_node = self._pw_node
         if not name or name == 'Dispositivo padrão':
-            new_idx = None
+            self._device  = None
             self._pw_node = None
             self._pa_port = None
         else:
-            pairs   = _sd_output_devices()
-            new_idx = next((idx for n, idx in pairs if n == name), None)
+            pairs = _sd_output_devices()
+            self._device  = next((idx for n, idx in pairs if n == name), None)
             self._pw_node = _PW_NODE_MAP.get(name)
             self._pa_port = _PA_PORT_MAP.get(name)
-        if new_idx == self._device:
+        if self._device == old_idx and self._pw_node == old_pw_node:
             return
-        self._device = new_idx
         if self._state in ('playing', 'paused'):
             was_playing = self._state == 'playing'
             self._state = 'paused'
@@ -880,6 +881,7 @@ class CueEngine(QObject):
         return [name for name, _ in _sd_output_devices()]
 
     def set_device(self, name: str):
+        old_pw_node = self._pw_node
         if not name or name == 'Dispositivo padrão':
             self._device  = None
             self._pw_node = None
@@ -889,7 +891,7 @@ class CueEngine(QObject):
             self._device  = next((idx for n, idx in pairs if n == name), None)
             self._pw_node = _PW_NODE_MAP.get(name)
             self._pa_port = _PA_PORT_MAP.get(name)
-        if self._stream is not None:
+        if self._pw_node != old_pw_node and self._stream is not None:
             self._close_stream()
 
     def load(self, path: str):
