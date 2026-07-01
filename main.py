@@ -79,19 +79,28 @@ def _load_backends():
             from collections import Counter as _Counter
             with _pulsectl.Pulse('djmix-early') as _pulse:
                 _sinks = _pulse.sink_list()
-                _raw = []
+                # Uma entrada por PORTA (igual ao pw-dump), não por sink
+                _entries: list[tuple[str, str, str, str]] = []  # (port_desc, sink_word, sink_name, port_name)
                 for _sink in _sinks:
-                    _avail = [p for p in _sink.port_list if str(p.available) != 'no']
-                    _raw.append(_avail[0].description if len(_avail) == 1 else _sink.description)
-                _count = _Counter(_raw)
-                for _sink, _desc in zip(_sinks, _raw):
-                    _display = (f'{_desc} – {_sink.description.split()[0]}'
-                                if _count[_desc] > 1 else _desc)
-                    _pa_sinks_early.append((_display, _sink.name))
-                    _PW_NODE_MAP[_display] = _sink.name
-            print(f'[djmix] pulsectl OK: {len(_pa_sinks_early)} sinks: {[n for n,_ in _pa_sinks_early]}', flush=True)
-        except Exception as _e:
-            print(f'[djmix] pulsectl ERRO: {_e}', flush=True)
+                    _sword = _sink.description.split()[0] if _sink.description else '?'
+                    _ports = _sink.port_list
+                    if _ports:
+                        for _port in _ports:
+                            _entries.append((_port.description, _sword, _sink.name, _port.name))
+                    else:
+                        _entries.append((_sink.description, _sword, _sink.name, ''))
+                _desc_count = _Counter(e[0] for e in _entries)
+                _multi = {e[2] for e in _entries
+                          if sum(1 for x in _entries if x[2] == e[2]) > 1}
+                for _pdesc, _sword, _sname, _pname in _entries:
+                    _display = (f'{_pdesc} – {_sword}'
+                                if _desc_count[_pdesc] > 1 or _sname in _multi
+                                else _pdesc)
+                    _pa_sinks_early.append((_display, _sname))
+                    _PW_NODE_MAP[_display] = _sname
+                    _PA_PORT_MAP[_display] = _pname
+        except Exception:
+            pass
     try:
         import sounddevice as _sd
         sd    = _sd
@@ -181,6 +190,8 @@ _PW_NODE_MAP: dict[str, str] = {}
 # Cache de sinks PulseAudio coletados ANTES do sounddevice/PortAudio inicializar
 # [(display_name, sink_name), ...]
 _pa_sinks_early: list[tuple[str, str]] = []
+# display_name → PulseAudio port.name (para troca de porta ativa antes de tocar)
+_PA_PORT_MAP: dict[str, str] = {}
 
 
 def _linux_pw_output_devices() -> list[tuple[str, int]]:
@@ -531,7 +542,8 @@ class AudioEngine(QObject):
         self._vu_l       = 0.0
         self._vu_r       = 0.0
 
-        self._pw_node     = None   # PipeWire node.name para roteamento
+        self._pw_node     = None   # PipeWire/PA sink name para roteamento
+        self._pa_port     = None   # PA port name (Flatpak: troca porta ativa)
         self._loader      = None   # _LoadThread em andamento
         self._fade_ramp   = None   # ramp pré-computado para fade-in
         self._fade_frames = 0      # frames restantes de fade-in no callback
@@ -551,10 +563,12 @@ class AudioEngine(QObject):
         if not name or name == 'Dispositivo padrão':
             new_idx = None
             self._pw_node = None
+            self._pa_port = None
         else:
             pairs   = _sd_output_devices()
             new_idx = next((idx for n, idx in pairs if n == name), None)
             self._pw_node = _PW_NODE_MAP.get(name)
+            self._pa_port = _PA_PORT_MAP.get(name)
         if new_idx == self._device:
             return
         self._device = new_idx
@@ -701,6 +715,13 @@ class AudioEngine(QObject):
         if self._pw_node:
             os.environ['PIPEWIRE_NODE'] = self._pw_node
             os.environ['PULSE_SINK'] = self._pw_node
+            if self._pa_port:
+                try:
+                    import pulsectl as _pctl
+                    with _pctl.Pulse('djmix-port') as _p:
+                        _p.sink_port_set(self._pw_node, self._pa_port)
+                except Exception:
+                    pass
         try:
             self._stream = sd.OutputStream(**kwargs)
             self._stream.start()
@@ -841,6 +862,7 @@ class CueEngine(QObject):
         self._stream    = None
         self._device    = None   # None = default
         self._pw_node     = None
+        self._pa_port     = None
         self._loader      = None
         self._fade_ramp   = None
         self._fade_frames = 0
@@ -858,10 +880,12 @@ class CueEngine(QObject):
         if not name or name == 'Dispositivo padrão':
             self._device  = None
             self._pw_node = None
+            self._pa_port = None
         else:
             pairs = _sd_output_devices()
             self._device  = next((idx for n, idx in pairs if n == name), None)
             self._pw_node = _PW_NODE_MAP.get(name)
+            self._pa_port = _PA_PORT_MAP.get(name)
 
     def load(self, path: str):
         """Carrega arquivo em QThread. Emite sig_loaded(bool) ao concluir na thread principal."""
@@ -981,6 +1005,13 @@ class CueEngine(QObject):
         if self._pw_node:
             os.environ['PIPEWIRE_NODE'] = self._pw_node
             os.environ['PULSE_SINK'] = self._pw_node
+            if self._pa_port:
+                try:
+                    import pulsectl as _pctl
+                    with _pctl.Pulse('djmix-port') as _p:
+                        _p.sink_port_set(self._pw_node, self._pa_port)
+                except Exception:
+                    pass
         try:
             self._stream = sd.OutputStream(**kwargs)
             self._stream.start()
