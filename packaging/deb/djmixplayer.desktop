@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=DJ Mix Player
+Comment=Player de músicas para DJs com múltiplas saídas de áudio
+Exec=/opt/djmixplayer/DJMixPlayer
+Icon=/opt/djmixplayer/_internal/assets/icon_256.png
+Terminal=false
+Type=Application
+Categories=Audio;Music;Player;
+StartupNotify=true

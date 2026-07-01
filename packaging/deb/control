@@ -1,0 +1,11 @@
+Package: djmixplayer
+Version: 1.0.7
+Architecture: amd64
+Maintainer: Rafael Lauriano <rafas.lau@gmail.com>
+Description: DJ Mix Player
+ Player de músicas para DJs com múltiplas playlists,
+ seleção de saída de áudio e sonoplastia (CUE).
+Section: sound
+Priority: optional
+Depends: libc6 (>= 2.17), libpulse0
+Recommends: ffmpeg
