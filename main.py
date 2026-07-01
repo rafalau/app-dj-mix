@@ -574,13 +574,16 @@ class AudioEngine(QObject):
         self._device = new_idx
         if self._state in ('playing', 'paused'):
             was_playing = self._state == 'playing'
-            self._state = 'paused'   # impede _on_finished de emitir sig_ended
+            self._state = 'paused'
             self._close_stream()
             self._start_stream()
             if was_playing:
                 self._state = 'playing'
             else:
                 self.sig_state.emit('paused')
+        elif self._stream is not None:
+            self._close_stream()
+            self._start_stream()
 
     def load(self, path: str):
         """Carrega arquivo em QThread. Emite sig_loaded(bool) ao concluir na thread principal."""
@@ -886,6 +889,8 @@ class CueEngine(QObject):
             self._device  = next((idx for n, idx in pairs if n == name), None)
             self._pw_node = _PW_NODE_MAP.get(name)
             self._pa_port = _PA_PORT_MAP.get(name)
+        if self._stream is not None:
+            self._close_stream()
 
     def load(self, path: str):
         """Carrega arquivo em QThread. Emite sig_loaded(bool) ao concluir na thread principal."""
