@@ -2,7 +2,7 @@
 ; Requer Inno Setup: https://jrsoftware.org/isinfo.php
 
 #define AppName      "DJ Mix Player"
-#define AppVersion   "1.0.7"
+#define AppVersion   "1.0.8"
 #define AppPublisher "Rafael Lauriano"
 #define AppURL       "https://github.com/rafalau/app-dj-mix"
 #define AppExeName   "DJMixPlayer.exe"

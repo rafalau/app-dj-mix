@@ -1,0 +1,130 @@
+DJ Mix Player — Performance Fixes
+===================================
+Data: 2026-07-01
+Versão: em desenvolvimento (pós 1.0.7)
+
+
+CONTEXTO
+--------
+Reportado por usuário rodando Zorin OS em notebook i3 2014, 8 GB RAM, SSD.
+Sintomas:
+  - Lentidão ao clicar em músicas (troca de cor + travada)
+  - VU meter congelava brevemente ao clicar
+  - Navegação pelo teclado (setas) praticamente impossível — cada tecla travava
+
+
+CAUSA RAIZ PRINCIPAL
+--------------------
+Cada clique ou tecla de seta disparava setStyleSheet() em até 64 painéis de
+playlist simultaneamente (8 páginas × 8 painéis por página), mesmo nos painéis
+que não precisavam mudar visualmente. No i3 2014, cada chamada setStyleSheet()
+no PyQt6 força recálculo completo de estilo + repintura da árvore de widgets,
+custando ~5-10ms por painel. Com 64 painéis = 300-500ms de travamento por tecla.
+
+
+FIXES APLICADOS
+---------------
+
+1. STATE TRACKING NOS PAINÉIS (PlaylistPanel)
+   Impacto: CRÍTICO
+
+   Problema: set_active() e set_focused() chamavam setStyleSheet() sempre,
+   independente do estado atual do painel.
+
+   Solução: adicionado self._style_state (None / 'inactive' / 'active' / 'focused').
+   set_active() e set_focused() retornam imediatamente se o estado não mudou.
+
+   Resultado: uma navegação típica toca apenas 2 painéis (o anterior + o novo),
+   não 64. Redução de ~97% nas chamadas a setStyleSheet por evento de foco.
+
+
+2. DEBOUNCE DE 80ms NO FOCO DE PAINÉIS (MainWindow)
+   Impacto: CRÍTICO
+
+   Problema: _on_focus() chamava _update_focused_panel_style() imediatamente.
+   Com repetição de teclado em ~30ms, cada frame disparava 64 setStyleSheet.
+
+   Solução: _on_focus() agenda um QTimer single-shot de 80ms. Se o usuário
+   pressionar setas rápido, o timer reinicia; só executa quando parar por 80ms.
+
+   Resultado: navegação contínua pelo teclado não trava mais — os estilos
+   atualizam apenas quando o usuário faz uma pausa natural.
+
+
+3. STRINGS DE ESTILO PRÉ-COMPUTADAS (PlaylistPanel)
+   Impacto: MÉDIO
+
+   Problema: _apply_list_style() reconstruía uma string de stylesheet de ~600
+   caracteres a cada chamada, com f-string interpolação de ~10 variáveis.
+
+   Solução: três strings constantes de classe (_SS_INACTIVE, _SS_ACTIVE,
+   _SS_FOCUSED) e dois estilos de header (_HDR_ACTIVE, _HDR_FOCUSED) são
+   definidos uma vez. O header inativo usa self._hdr_inactive (string criada
+   no __init__ com a cor da playlist).
+
+   Resultado: zero alocação de string por evento de foco.
+
+
+4. SINAL DUPLICADO REMOVIDO (PlaylistPanel)
+   Impacto: ALTO
+
+   Problema: itemClicked e currentItemChanged ambos emitiam sig_focus.
+   Um clique disparava _on_focus() duas vezes, dobrando o trabalho.
+
+   Solução: removida a conexão de itemClicked. currentItemChanged já cobre
+   clique e navegação por teclado.
+
+
+5. PIXMAP CACHE NO VU METER (VUMeter)
+   Impacto: ALTO
+
+   Problema: paintEvent() redesenhava tudo a cada frame (25x/seg):
+     - Face circular com borda
+     - 3 zonas de arco de fundo (verde/amarelo/vermelho com alpha 55)
+     - 8 tick marks com cálculos trigonométricos
+     - Labels com QFont criado na hora
+     - Import "from PyQt6.QtGui import QPen" DENTRO do paintEvent
+   Tudo isso para então desenhar a agulha por cima.
+
+   Solução: partes estáticas (face, zonas de fundo, ticks, labels, label de
+   canal) são renderizadas em QPixmap uma única vez em _build_bg_cache().
+   Cache é invalidado apenas ao redimensionar (resizeEvent).
+   Cada frame faz: drawPixmap (blit) + 3-6 arcos de nível + peak + agulha.
+
+   Resultado: ~80% menos trabalho de pintura por frame no VU meter.
+
+
+6. CORES PRÉ-ALOCADAS NOS VU BARS (DigitalVUBar, HDigitalVUBar)
+   Impacto: MÉDIO
+
+   Problema: paintEvent() criava QColor() em cada iteração do loop de
+   segmentos (~20-100 por frame), incluindo QColor com setAlpha() para
+   segmentos apagados.
+
+   Solução: seis QColor pré-alocados como variáveis de classe (_C_LIT e
+   _C_DIM, um par para cada zona de cor). Inicializados uma vez via
+   _init_colors(). QFont do label também cacheado como classe (_FONT_LBL).
+
+   Resultado: zero alocação de objeto por segmento por frame.
+
+
+7. CUE BUTTONS COM ESTILOS CACHEADOS (MainWindow)
+   Impacto: MÉDIO
+
+   Problema: _refresh_cue_buttons() reconstruía 5 strings de stylesheet
+   a cada evento de foco, e chamava setStyleSheet() em todos os 5 botões
+   sempre, independente de mudança.
+
+   Solução: estilos pré-computados na primeira chamada (_CUE_SS_ON por
+   índice, _CUE_SS_OFF global). setStyleSheet() só chamado quando o estado
+   do botão muda (isChecked() verifica estado atual).
+
+
+RESUMO DE IMPACTO ESPERADO
+--------------------------
+  Antes:  cada tecla/clique = 64+ setStyleSheet + 1 paintEvent completo de VU
+  Depois: cada tecla/clique = 0-2 setStyleSheet (debounced) + blit de cache
+
+  Navegação por teclado: de "praticamente impossível" para fluida
+  Clique em música: sem travada visível
+  VU meter: ~80% menos carga de CPU por frame

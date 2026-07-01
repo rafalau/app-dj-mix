@@ -27,7 +27,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QLabel, QPushButton, QListWidget, QListWidgetItem,
     QLineEdit, QComboBox, QFileDialog, QMessageBox, QMenu,
-    QTabWidget, QSizePolicy, QFrame, QScrollArea, QDialog,
+    QTabWidget, QSizePolicy, QFrame, QScrollArea, QDialog, QSplashScreen,
 )
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QObject, QMimeData, QUrl, QPointF, QRectF, QSize, QPoint
 from PyQt6.QtGui import (QPainter, QColor, QLinearGradient, QRadialGradient, QFont,
@@ -1784,6 +1784,8 @@ class VUMeter(QWidget):
         self._lvl  = 0.0
         self._peak = 0.0
         self._hold = 0
+        self._bg_cache: QPixmap | None = None  # static parts cached here
+        self._bg_cache_size = (0, 0)           # invalidate on resize
         self.setMinimumSize(140, 120)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
@@ -1799,88 +1801,111 @@ class VUMeter(QWidget):
                 self._peak = max(0.0, self._peak - 0.012)
         self.update()
 
-    def paintEvent(self, _):
-        from PyQt6.QtGui import QPen
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._bg_cache = None  # invalidate static cache on resize
 
-        p = QPainter(self)
+    def _build_bg_cache(self, w: int, h: int) -> tuple:
+        """Render static parts (face, zones, ticks) into a QPixmap. Returns (pixmap, metrics)."""
+        pix = QPixmap(w, h)
+        pix.fill(QColor(C['bg']))
+        p = QPainter(pix)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        w, h = self.width(), self.height()
-
-        p.fillRect(0, 0, w, h, QColor(C['bg']))
 
         margin = 4
         cx = w / 2.0
-        # r limitado para que topo da face (cy - r - ARC_W) não saia do widget
-        # ARC_W ≈ r/5 → r + r/5 = 6r/5 ≤ cy → r ≤ 5*cy/6
-        r_tmp  = int(min((cx - 2) * 5.0 / 6.0, h - margin - 4))
-        ARC_W  = max(6, r_tmp // 5)
-        cy     = float(h - ARC_W - margin)
-        r      = int(min((cx - 2) * 5.0 / 6.0, cy * 5.0 / 6.0 - 1))
-        ARC_W  = max(6, r // 5)
+        r_tmp = int(min((cx - 2) * 5.0 / 6.0, h - margin - 4))
+        ARC_W = max(6, r_tmp // 5)
+        cy    = float(h - ARC_W - margin)
+        r     = int(min((cx - 2) * 5.0 / 6.0, cy * 5.0 / 6.0 - 1))
+        ARC_W = max(6, r // 5)
         r_mid = r - ARC_W // 2
-
-        # Face do medidor
         cxi, cyi = int(cx), int(cy)
+
+        # Face
         p.setPen(QPen(QColor('#2a2a2a'), 2))
         p.setBrush(QColor('#111820'))
         p.drawEllipse(cxi - r - ARC_W, cyi - r - ARC_W,
                       (r + ARC_W) * 2, (r + ARC_W) * 2)
 
-        # ── helper: desenha arco em convenção Qt ──────────────────────────
-        # start_deg e span_deg em graus Qt (CCW a partir de 3h)
+        G_SPAN, Y_SPAN, R_SPAN = 129, 26, 25
+
+        def arc_bg(start_deg, span_deg, color, alpha):
+            col = QColor(color); col.setAlpha(alpha)
+            p.setPen(QPen(col, ARC_W, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap))
+            p.drawArc(cxi - r_mid, cyi - r_mid, r_mid * 2, r_mid * 2,
+                      int(start_deg * 16), int(span_deg * 16))
+
+        arc_bg(180,                    G_SPAN, C['vu_green'],  55)
+        arc_bg(180 + G_SPAN,           Y_SPAN, C['vu_yellow'], 55)
+        arc_bg(180 + G_SPAN + Y_SPAN,  R_SPAN, C['vu_red'],    55)
+
+        # Ticks and labels
+        font_tick = QFont('Roboto', max(5, r // 12), QFont.Weight.Bold)
+        SCALE_MAX = 140
+        ri = r - ARC_W - 1
+        for val in range(0, 141, 20):
+            major = (val % 40 == 0 or val == 100)
+            pct = val / SCALE_MAX
+            a = math.radians(180 - pct * 180)
+            ca, sa = math.cos(a), math.sin(a)
+            tick_len = 9 if major else 5
+            x1 = cxi + int(ri * ca);              y1 = cyi - int(ri * sa)
+            x2 = cxi + int((ri - tick_len) * ca); y2 = cyi - int((ri - tick_len) * sa)
+            p.setPen(QPen(QColor('#666666' if major else '#404040'), 1))
+            p.drawLine(x1, y1, x2, y2)
+            if major:
+                outer_r = r + ARC_W // 2 + 3
+                lbl_r = min(outer_r, int(cx) - 13)
+                lx = cxi + int(lbl_r * ca) - 10
+                lift = int((1.0 - abs(sa)) * 9)
+                ly = cyi - int(lbl_r * sa) - 7 - lift
+                p.setPen(QColor('#aaaaaa' if val != 100 else '#ddaa00'))
+                p.setFont(font_tick)
+                p.drawText(lx, ly, 20, 14, Qt.AlignmentFlag.AlignCenter, str(val))
+
+        # Channel label
+        p.setPen(QColor('#aaaaaa'))
+        p.setFont(QFont('Roboto', 10, QFont.Weight.Bold))
+        p.drawText(0, cyi - r // 2, w, r // 2,
+                   Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                   self.ch)
+        p.end()
+        return pix, (r, ARC_W, r_mid, cxi, cyi, G_SPAN, Y_SPAN, R_SPAN)
+
+    def paintEvent(self, _):
+        w, h = self.width(), self.height()
+
+        # Rebuild static background only when size changes
+        if self._bg_cache is None or self._bg_cache_size != (w, h):
+            self._bg_cache, self._bg_metrics = self._build_bg_cache(w, h)
+            self._bg_cache_size = (w, h)
+
+        r, ARC_W, r_mid, cxi, cyi, G_SPAN, Y_SPAN, R_SPAN = self._bg_metrics
+
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.drawPixmap(0, 0, self._bg_cache)  # blit static parts
+
+        # ── Zonas preenchidas até o nível atual ───────────────────────────
         def arc(start_deg, span_deg, color, alpha=255):
             col = QColor(color); col.setAlpha(alpha)
             p.setPen(QPen(col, ARC_W, Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap))
             p.drawArc(cxi - r_mid, cyi - r_mid, r_mid * 2, r_mid * 2,
                       int(start_deg * 16), int(span_deg * 16))
 
-        # ── Zonas de fundo (escala 0-100-140) ────────────────────────────
-        # Verde: 0→100  = 100/140 × 180° = 128.6° ≈ 129°
-        # Amarelo: 100→120 = 20/140 × 180° = 25.7° ≈ 26°
-        # Vermelho: 120→140 = 20/140 × 180° = 25.4° ≈ 25°
-        G_SPAN, Y_SPAN, R_SPAN = 129, 26, 25  # total = 180°
-        arc(180,             G_SPAN, C['vu_green'],  55)
-        arc(180 + G_SPAN,    Y_SPAN, C['vu_yellow'], 55)
-        arc(180 + G_SPAN + Y_SPAN, R_SPAN, C['vu_red'], 55)
-
-        # ── Zonas preenchidas até o nível atual ───────────────────────────
         sweep = self._lvl * 180
         g_fill = min(sweep, G_SPAN)
         if g_fill > 0:
-            arc(180, g_fill, C['vu_green'], 255)
+            arc(180, g_fill, C['vu_green'])
             sweep -= g_fill
         y_fill = min(sweep, Y_SPAN)
         if y_fill > 0:
-            arc(180 + G_SPAN, y_fill, C['vu_yellow'], 255)
+            arc(180 + G_SPAN, y_fill, C['vu_yellow'])
             sweep -= y_fill
         r_fill = min(sweep, R_SPAN)
         if r_fill > 0:
-            arc(180 + G_SPAN + Y_SPAN, r_fill, C['vu_red'], 255)
-
-        # ── Marcações e números (escala 0, 20, 40, 60, 80, 100, 120, 140) ─
-        SCALE_MAX = 140
-        ticks = [(v, v % 40 == 0 or v == 100) for v in range(0, 141, 20)]
-        for val, major in ticks:
-            pct = val / SCALE_MAX
-            a  = math.radians(180 - pct * 180)
-            ca, sa = math.cos(a), math.sin(a)
-            tick_len = 9 if major else 5
-            ri = r - ARC_W - 1
-            x1 = cxi + int(ri * ca);            y1 = cyi - int(ri * sa)
-            x2 = cxi + int((ri - tick_len) * ca); y2 = cyi - int((ri - tick_len) * sa)
-            p.setPen(QPen(QColor('#666666' if major else '#404040'), 1))
-            p.drawLine(x1, y1, x2, y2)
-            if major:
-                # Labels fora do arco (entre arco e borda do widget)
-                outer_r = r + ARC_W // 2 + 3
-                lbl_r   = min(outer_r, int(cx) - 13)
-                lx = cxi + int(lbl_r * ca) - 10
-                # levanta labels horizontais para não colarem na borda inferior
-                lift = int((1.0 - abs(sa)) * 9)
-                ly = cyi - int(lbl_r * sa) - 7 - lift
-                p.setPen(QColor('#aaaaaa' if val != 100 else '#ddaa00'))
-                p.setFont(QFont('Roboto', max(5, r // 12), QFont.Weight.Bold))
-                p.drawText(lx, ly, 20, 14, Qt.AlignmentFlag.AlignCenter, str(val))
+            arc(180 + G_SPAN + Y_SPAN, r_fill, C['vu_red'])
 
         # ── Peak hold ─────────────────────────────────────────────────────
         if self._peak > 0.02:
@@ -1888,11 +1913,11 @@ class VUMeter(QWidget):
             pk_c = (C['vu_red'] if self._peak > 0.85 else
                     C['vu_yellow'] if self._peak > 0.65 else C['vu_green'])
             p.setPen(QPen(QColor(pk_c), 2))
-            px1 = cxi + int((r - ARC_W - 2) * math.cos(pa))
-            py1 = cyi - int((r - ARC_W - 2) * math.sin(pa))
-            px2 = cxi + int((r - ARC_W - 12) * math.cos(pa))
-            py2 = cyi - int((r - ARC_W - 12) * math.sin(pa))
-            p.drawLine(px1, py1, px2, py2)
+            cos_pa, sin_pa = math.cos(pa), math.sin(pa)
+            p.drawLine(
+                cxi + int((r - ARC_W - 2)  * cos_pa), cyi - int((r - ARC_W - 2)  * sin_pa),
+                cxi + int((r - ARC_W - 12) * cos_pa), cyi - int((r - ARC_W - 12) * sin_pa),
+            )
 
         # ── Agulha principal ──────────────────────────────────────────────
         na = math.radians(180 - self._lvl * 180)
@@ -1905,20 +1930,30 @@ class VUMeter(QWidget):
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QColor('#cccccc'))
         p.drawEllipse(cxi - 4, cyi - 4, 8, 8)
-
-        # Label
-        p.setPen(QColor('#aaaaaa'))
-        p.setFont(QFont('Roboto', 10, QFont.Weight.Bold))
-        p.drawText(0, cyi - r // 2, w, r // 2,
-                   Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
-                   self.ch)
         p.end()
 
 
 # ── Digital VU Bar (segmentos verticais) ─────────────────────────────────────
 class DigitalVUBar(QWidget):
+    # Pre-built QColor objects — created once, reused every frame
+    _C_BG  = None
+    _C_LIT = None   # [green, yellow, red] full
+    _C_DIM = None   # [green, yellow, red] dimmed
+
+    @classmethod
+    def _init_colors(cls):
+        if cls._C_BG is not None:
+            return
+        cls._C_BG = QColor(C['bg'])
+        cls._C_LIT = [QColor(C['vu_green']), QColor(C['vu_yellow']), QColor(C['vu_red'])]
+        dims = []
+        for c in (C['vu_green'], C['vu_yellow'], C['vu_red']):
+            d = QColor(c); d.setAlpha(30); dims.append(d)
+        cls._C_DIM = dims
+
     def __init__(self, parent=None):
         super().__init__(parent)
+        DigitalVUBar._init_colors()
         self._lvl  = 0.0
         self._peak = 0.0
         self._hold = 0
@@ -1941,41 +1976,43 @@ class DigitalVUBar(QWidget):
     def paintEvent(self, _):
         p = QPainter(self)
         w, h = self.width(), self.height()
-        p.fillRect(0, 0, w, h, QColor(C['bg']))
+        p.fillRect(0, 0, w, h, self._C_BG)
 
         SEG, GAP = 3, 1
         STEP  = SEG + GAP
         total = max(1, h // STEP)
         lit   = int(self._lvl * total)
+        lit_c = self._C_LIT
+        dim_c = self._C_DIM
 
         for i in range(total):
             pct = i / total
-            color = (C['vu_red'] if pct >= 0.85 else
-                     C['vu_yellow'] if pct >= 0.65 else C['vu_green'])
+            ci = 2 if pct >= 0.85 else (1 if pct >= 0.65 else 0)
             y = h - (i + 1) * STEP
-            if i < lit:
-                p.fillRect(1, y, w - 2, SEG, QColor(color))
-            else:
-                dim = QColor(color); dim.setAlpha(30)
-                p.fillRect(1, y, w - 2, SEG, dim)
+            p.fillRect(1, y, w - 2, SEG, lit_c[ci] if i < lit else dim_c[ci])
 
         if self._peak > 0.02:
             pk_i = min(int(self._peak * total), total - 1)
             pk_y = h - (pk_i + 1) * STEP
-            pk_c = (C['vu_red'] if self._peak >= 0.85 else
-                    C['vu_yellow'] if self._peak >= 0.65 else C['vu_green'])
-            p.fillRect(1, pk_y, w - 2, SEG, QColor(pk_c))
+            ci = 2 if self._peak >= 0.85 else (1 if self._peak >= 0.65 else 0)
+            p.fillRect(1, pk_y, w - 2, SEG, lit_c[ci])
         p.end()
 
 
 # ── Digital VU Bar Horizontal ─────────────────────────────────────────────────
 class HDigitalVUBar(QWidget):
+    _FONT_LBL = None
+
     def __init__(self, label='L', parent=None):
         super().__init__(parent)
+        if HDigitalVUBar._FONT_LBL is None:
+            HDigitalVUBar._FONT_LBL = QFont('Roboto', 7, QFont.Weight.Bold)
+        DigitalVUBar._init_colors()   # reuse same color cache
         self._lvl  = 0.0
         self._peak = 0.0
         self._hold = 0
         self._label = label
+        self._pen_lbl = QPen(QColor('#555555'))
         self.setFixedHeight(10)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
@@ -1994,7 +2031,7 @@ class HDigitalVUBar(QWidget):
     def paintEvent(self, _):
         p = QPainter(self)
         w, h = self.width(), self.height()
-        p.fillRect(0, 0, w, h, QColor(C['bg']))
+        p.fillRect(0, 0, w, h, DigitalVUBar._C_BG)
 
         LBL_W = 14
         bar_w = w - LBL_W - 4
@@ -2002,29 +2039,27 @@ class HDigitalVUBar(QWidget):
         STEP  = SEG + GAP
         total = max(1, bar_w // STEP)
         lit   = int(self._lvl * total)
+        lit_c = DigitalVUBar._C_LIT
+        dim_c = DigitalVUBar._C_DIM
 
-        p.setPen(QColor('#555555'))
-        p.setFont(QFont('Roboto', 7, QFont.Weight.Bold))
-        p.drawText(0, 0, LBL_W, h, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignHCenter, self._label)
+        p.setPen(self._pen_lbl)
+        p.setFont(self._FONT_LBL)
+        p.drawText(0, 0, LBL_W, h,
+                   Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignHCenter,
+                   self._label)
 
         x0 = LBL_W + 2
         for i in range(total):
             pct = i / total
-            color = (C['vu_red'] if pct >= 0.85 else
-                     C['vu_yellow'] if pct >= 0.65 else C['vu_green'])
+            ci = 2 if pct >= 0.85 else (1 if pct >= 0.65 else 0)
             x = x0 + i * STEP
-            if i < lit:
-                p.fillRect(x, 1, SEG, h - 2, QColor(color))
-            else:
-                dim = QColor(color); dim.setAlpha(30)
-                p.fillRect(x, 1, SEG, h - 2, dim)
+            p.fillRect(x, 1, SEG, h - 2, lit_c[ci] if i < lit else dim_c[ci])
 
         if self._peak > 0.02:
             pk_i = min(int(self._peak * total), total - 1)
             pk_x = x0 + pk_i * STEP
-            pk_c = (C['vu_red'] if self._peak >= 0.85 else
-                    C['vu_yellow'] if self._peak >= 0.65 else C['vu_green'])
-            p.fillRect(pk_x, 1, SEG, h - 2, QColor(pk_c))
+            ci = 2 if self._peak >= 0.85 else (1 if self._peak >= 0.65 else 0)
+            p.fillRect(pk_x, 1, SEG, h - 2, lit_c[ci])
         p.end()
 
 
@@ -2131,6 +2166,58 @@ class PlaylistPanel(QWidget):
     sig_cue   = pyqtSignal(str)
     sig_focus = pyqtSignal(str)
 
+    # Pre-computed list stylesheets — built once, reused forever
+    _SS_INACTIVE = (
+        "QListWidget{background:#111827;border:1px solid #1e3a5f;border-top:none;"
+        "border-radius:0 0 3px 3px;color:#d1d5db;"
+        "font-family:'Roboto','DejaVu Sans','Arial',sans-serif;"
+        "font-size:15px;font-weight:bold;outline:none;}"
+        "QListWidget::item{height:22px;padding-left:4px;"
+        "border-bottom:1px solid rgba(255,255,255,.06);}"
+        "QListWidget::item:selected{background:#1e3a5f;}"
+        "QListWidget::item:selected:active{background:#1e3a5f;}"
+        "QListWidget::item:hover{background:#1a2d47;}"
+        "QListWidget::item:focus{outline:none;}"
+        "QScrollBar:vertical{background:#0d1525;width:12px;border-radius:4px;margin:2px;}"
+        "QScrollBar::handle:vertical{background:#1464b4;border-radius:4px;min-height:24px;}"
+        "QScrollBar::handle:vertical:hover{background:#1e90ff;}"
+        "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}"
+    )
+    _SS_ACTIVE = (
+        "QListWidget{background:#0d3a7a;border:1px solid #1565c0;border-top:none;"
+        "border-radius:0 0 3px 3px;color:#ffffff;"
+        "font-family:'Roboto','DejaVu Sans','Arial',sans-serif;"
+        "font-size:15px;font-weight:bold;outline:none;}"
+        "QListWidget::item{height:22px;padding-left:4px;"
+        "border-bottom:1px solid rgba(255,255,255,.12);}"
+        "QListWidget::item:selected{background:#1976d2;}"
+        "QListWidget::item:selected:active{background:#1976d2;}"
+        "QListWidget::item:hover{background:#1565c0;}"
+        "QListWidget::item:focus{outline:none;}"
+        "QScrollBar:vertical{background:#0a2a5e;width:12px;border-radius:4px;margin:2px;}"
+        "QScrollBar::handle:vertical{background:#1878d4;border-radius:4px;min-height:24px;}"
+        "QScrollBar::handle:vertical:hover{background:#1e90ff;}"
+        "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}"
+    )
+    _SS_FOCUSED = (
+        "QListWidget{background:#0d2a30;border:1px solid #1a6070;border-top:none;"
+        "border-radius:0 0 3px 3px;color:#e0f4f8;"
+        "font-family:'Roboto','DejaVu Sans','Arial',sans-serif;"
+        "font-size:15px;font-weight:bold;outline:none;}"
+        "QListWidget::item{height:22px;padding-left:4px;"
+        "border-bottom:1px solid rgba(180,230,240,.10);}"
+        "QListWidget::item:selected{background:#1a5a6a;}"
+        "QListWidget::item:selected:active{background:#1a5a6a;}"
+        "QListWidget::item:hover{background:#143a44;}"
+        "QListWidget::item:focus{outline:none;}"
+        "QScrollBar:vertical{background:#0a1e24;width:12px;border-radius:4px;margin:2px;}"
+        "QScrollBar::handle:vertical{background:#1a6070;border-radius:4px;min-height:24px;}"
+        "QScrollBar::handle:vertical:hover{background:#1e90ff;}"
+        "QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}"
+    )
+    _HDR_ACTIVE  = "background:#1565c0;border-radius:3px 3px 0 0;"
+    _HDR_FOCUSED = "background:#1a6070;border-radius:3px 3px 0 0;"
+
     def __init__(self, name: str, color: str, parent=None):
         super().__init__(parent)
         self._name         = name
@@ -2138,6 +2225,8 @@ class PlaylistPanel(QWidget):
         self._color        = color
         self._songs: list[str] = []
         self._repeat = 0   # 0=off  1=repeat one  2=repeat all
+        self._style_state  = None   # tracks current visual state to skip redundant setStyleSheet
+        self._hdr_inactive = f"background:{color};border-radius:3px 3px 0 0;"
         self.setAcceptDrops(True)
         self._build()
 
@@ -2283,99 +2372,41 @@ class PlaylistPanel(QWidget):
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._list.setFont(QFont('Roboto', 15, QFont.Weight.Bold))
         self._list.setItemDelegate(SongDelegate())
-        self._apply_list_style(active=False)
+        self.set_active(False)  # sets _style_state = 'inactive' so first refresh is free
         self._list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._list.customContextMenuRequested.connect(self._ctx)
         self._list.itemDoubleClicked.connect(lambda i: self.sig_play.emit(i.path))
         self._list.currentItemChanged.connect(
             lambda cur, _: self.sig_focus.emit(cur.path) if cur else None)
-        self._list.itemClicked.connect(
-            lambda item: self.sig_focus.emit(item.path) if item else None)
         self._list.keyPressEvent = self._list_key_press
         layout.addWidget(self._list)
 
     def _apply_list_style(self, active):
+        """Kept for compatibility; prefer set_active/set_focused which check state first."""
         if active == 'focused':
-            bg_color     = '#0d2a30'
-            border_color = '#1a6070'
-            text_color   = '#e0f4f8'
-            sel_color    = '#1a5a6a'
-            hover_color  = '#143a44'
-            item_border  = 'rgba(180,230,240,.10)'
-            scroll_bg    = '#0a1e24'
-            scroll_hdl   = '#1a6070'
+            self._list.setStyleSheet(self._SS_FOCUSED)
         elif active:
-            bg_color     = '#0d3a7a'
-            border_color = '#1565c0'
-            text_color   = '#ffffff'
-            sel_color    = '#1976d2'
-            hover_color  = '#1565c0'
-            item_border  = 'rgba(255,255,255,.12)'
-            scroll_bg    = '#0a2a5e'
-            scroll_hdl   = '#1878d4'
+            self._list.setStyleSheet(self._SS_ACTIVE)
         else:
-            bg_color     = '#111827'
-            border_color = '#1e3a5f'
-            text_color   = '#d1d5db'
-            sel_color    = '#1e3a5f'
-            hover_color  = '#1a2d47'
-            item_border  = 'rgba(255,255,255,.06)'
-            scroll_bg    = '#0d1525'
-            scroll_hdl   = '#1464b4'
-
-        self._list.setStyleSheet(f"""
-            QListWidget{{
-                background:{bg_color};
-                border:1px solid {border_color};
-                border-top:none;
-                border-radius:0 0 3px 3px;
-                color:{text_color};
-                font-family:'Roboto','DejaVu Sans','Arial',sans-serif;
-                font-size:15px;
-                font-weight:bold;
-                outline:none;
-            }}
-            QListWidget::item{{
-                height:22px;
-                padding-left:4px;
-                border-bottom:1px solid {item_border};
-            }}
-            QListWidget::item:selected{{background:{sel_color};}}
-            QListWidget::item:selected:active{{background:{sel_color};}}
-            QListWidget::item:hover{{background:{hover_color};}}
-            QListWidget::item:focus{{outline:none;}}
-            QScrollBar:vertical{{
-                background:{scroll_bg};
-                width:12px;
-                border-radius:4px;
-                margin:2px;
-            }}
-            QScrollBar::handle:vertical{{
-                background:{scroll_hdl};
-                border-radius:4px;
-                min-height:24px;
-            }}
-            QScrollBar::handle:vertical:hover{{
-                background:#1e90ff;
-            }}
-            QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{{height:0;}}
-        """)
+            self._list.setStyleSheet(self._SS_INACTIVE)
 
     def set_active(self, active: bool):
-        self._apply_list_style(active)
-        hdr_bg = '#1565c0' if active else self._color
-        self._hdr.setStyleSheet(
-            f"background:{hdr_bg};border-radius:3px 3px 0 0;"
-        )
-        self._list.update()
-        self._hdr.update()
+        new_state = 'active' if active else 'inactive'
+        hdr_ss    = self._HDR_ACTIVE if active else self._hdr_inactive
+        list_ss   = self._SS_ACTIVE  if active else self._SS_INACTIVE
+        if self._style_state == new_state:
+            return  # already in this state — skip expensive setStyleSheet
+        self._style_state = new_state
+        self._list.setStyleSheet(list_ss)
+        self._hdr.setStyleSheet(hdr_ss)
 
     def set_focused(self):
         """Estado de seleção via teclado/clique — tom teal, diferente do azul de tocando."""
-        self._apply_list_style('focused')
-        self._hdr.setStyleSheet("background:#1a6070;border-radius:3px 3px 0 0;")
-        self._list.update()
-        self._hdr.update()
+        if self._style_state == 'focused':
+            return
+        self._style_state = 'focused'
+        self._list.setStyleSheet(self._SS_FOCUSED)
+        self._hdr.setStyleSheet(self._HDR_FOCUSED)
 
     def _list_key_press(self, event):
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
@@ -4069,9 +4100,11 @@ class SettingsDialog(QDialog):
 class MainWindow(QMainWindow):
     _sig_update = pyqtSignal(str, str, str)   # tag, dl_url, body
 
-    def __init__(self):
+    def __init__(self, splash: '_SplashScreen | None' = None):
         super().__init__()
+        self._splash = splash
         self._sig_update.connect(self._show_update_dialog)
+        self._splash_msg('Inicializando áudio...', 20)
         self._engine        = AudioEngine()
         self._cue_engine    = CueEngine()
         self._current: str | None = None
@@ -4099,9 +4132,16 @@ class MainWindow(QMainWindow):
         self._sfx_restore_timer = QTimer(self)
         self._sfx_restore_timer.setSingleShot(True)
         self._sfx_restore_timer.timeout.connect(self._sfx_on_ended)
+        self._splash_msg('Construindo interface...', 50)
         self._build()
         self._cue_window = CueWindow(self._cue_engine, self)
         self._wire()
+        # Debounce timer for panel focus updates (avoids 64× setStyleSheet per keystroke)
+        self._focus_timer = QTimer(self)
+        self._focus_timer.setSingleShot(True)
+        self._focus_timer.setInterval(80)
+        self._focus_timer.timeout.connect(self._update_focused_panel_style)
+        self._splash_msg('Carregando playlists...', 80)
         self._load()
         self.setWindowTitle(f'DJ Mix Player  v{APP_VERSION}')
         self.resize(1280, 820)
@@ -4109,6 +4149,10 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(300, self._refresh_panel_styles)
         if HAS_UPDATER:
             QTimer.singleShot(4000, self._check_update)
+
+    def _splash_msg(self, msg: str, progress: int = 0) -> None:
+        if self._splash is not None:
+            self._splash.set_status(msg, progress)
 
     # ── Auto-update ──────────────────────────────────────────────────────
     def _check_update(self):
@@ -4613,13 +4657,16 @@ class MainWindow(QMainWindow):
     def _on_focus(self, path: str):
         self._focused = path
         self._refresh_cue_buttons()
-        self._update_focused_panel_style(path)
+        # Debounce: hold 80 ms so rapid arrow-key navigation doesn't trigger
+        # dozens of setStyleSheet calls per second.
+        self._focus_timer.start()
 
-    def _update_focused_panel_style(self, path: str):
+    def _update_focused_panel_style(self, path: str = ''):
+        path = path or self._focused or ''
         for pg in self._pages:
             for panel in pg.get_panels():
                 is_playing = bool(self._current and self._current in panel._songs)
-                is_focused = path in panel._songs
+                is_focused = bool(path and path in panel._songs)
                 if is_playing:
                     panel.set_active(True)
                 elif is_focused:
@@ -4627,51 +4674,46 @@ class MainWindow(QMainWindow):
                 else:
                     panel.set_active(False)
 
+    # Pre-computed CUE button stylesheets — built once at class level
+    _CUE_COLORS    = ['#7a5800', '#7a3000', '#005533', '#440077', '#770022']
+    _CUE_COLORS_LT = ['#ffcc00', '#ff6600', '#00dd88', '#cc44ff', '#ff4466']
+    _CUE_SS_ON: list[str] = []   # filled lazily
+    _CUE_SS_OFF: str = ''        # filled lazily
+    _CUE_SS_READY = False
+
+    def _ensure_cue_ss(self):
+        if MainWindow._CUE_SS_READY:
+            return
+        for col, clt in zip(self._CUE_COLORS, self._CUE_COLORS_LT):
+            MainWindow._CUE_SS_ON.append(
+                f"QPushButton{{background:{col};color:{clt};border:1px solid {clt};"
+                f"border-radius:5px;font-size:11px;font-weight:bold;"
+                f"letter-spacing:1px;padding:0 10px;min-width:48px;}}"
+                f"QPushButton:hover{{background:{clt};color:white;}}"
+            )
+        MainWindow._CUE_SS_OFF = (
+            f"QPushButton{{background:{C['panel']};color:{C['text_dim']};"
+            f"border:1px solid {C['border']};border-radius:5px;font-size:11px;"
+            f"font-weight:bold;letter-spacing:1px;padding:0 10px;min-width:48px;}}"
+            f"QPushButton:hover{{background:{C['hover']};color:{C['text']};"
+            f"border-color:{C['border2']};}}"
+        )
+        MainWindow._CUE_SS_READY = True
+
     def _refresh_cue_buttons(self):
-        CUE_SLOT_COLORS = ['#7a5800', '#7a3000', '#005533', '#440077', '#770022']
-        CUE_SLOT_COLORS_LT = ['#ffcc00', '#ff6600', '#00dd88', '#cc44ff', '#ff4466']
+        self._ensure_cue_ss()
         path = self._focused or self._current
         slots = _cue_slots(path) if path else [None] * 5
         for i, btn in enumerate(self._cue_btns):
             frac = slots[i]
-            col  = CUE_SLOT_COLORS[i]
-            clt  = CUE_SLOT_COLORS_LT[i]
             if frac is not None:
-                btn.setChecked(True)
-                btn.setStyleSheet(f"""
-                    QPushButton{{
-                        background:{col};
-                        color:{clt};
-                        border:1px solid {clt};
-                        border-radius:5px;
-                        font-size:11px;
-                        font-weight:bold;
-                        letter-spacing:1px;
-                        padding:0 10px;
-                        min-width:48px;
-                    }}
-                    QPushButton:hover{{background:{clt};color:white;}}
-                """)
+                if not btn.isChecked():
+                    btn.setChecked(True)
+                    btn.setStyleSheet(self._CUE_SS_ON[i])
             else:
-                btn.setChecked(False)
-                btn.setStyleSheet(f"""
-                    QPushButton{{
-                        background:{C['panel']};
-                        color:{C['text_dim']};
-                        border:1px solid {C['border']};
-                        border-radius:5px;
-                        font-size:11px;
-                        font-weight:bold;
-                        letter-spacing:1px;
-                        padding:0 10px;
-                        min-width:48px;
-                    }}
-                    QPushButton:hover{{
-                        background:{C['hover']};
-                        color:{C['text']};
-                        border-color:{C['border2']};
-                    }}
-                """)
+                if btn.isChecked():
+                    btn.setChecked(False)
+                    btn.setStyleSheet(self._CUE_SS_OFF)
 
     def _on_cue_btn(self, idx: int):
         path = self._focused or self._current
@@ -5370,6 +5412,121 @@ class MainWindow(QMainWindow):
         ev.accept()
 
 
+# ── Splash screen ─────────────────────────────────────────────────────────────
+class _SplashScreen(QWidget):
+    """Splash screen exibido durante a inicialização."""
+
+    _W, _H = 540, 300
+
+    def __init__(self, version: str, base_path: Path):
+        super().__init__()
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint |
+            Qt.WindowType.WindowStaysOnTopHint |
+            Qt.WindowType.SplashScreen
+        )
+        self.setFixedSize(self._W, self._H)
+
+        screen = QApplication.primaryScreen().geometry()
+        self.move(
+            (screen.width()  - self._W) // 2,
+            (screen.height() - self._H) // 2,
+        )
+
+        self._build_ui(version, base_path)
+
+    def _build_ui(self, version: str, base_path: Path) -> None:
+        self._progress = 0
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(36, 28, 36, 26)
+        root.setSpacing(0)
+
+        # ── Top: title + icon ────────────────────────────────────────────────
+        top = QHBoxLayout()
+        top.setSpacing(0)
+
+        left = QVBoxLayout()
+        left.setSpacing(6)
+
+        title = QLabel('DJ Mix Player')
+        title.setStyleSheet(
+            'color:#ffffff; font-size:28px; font-weight:bold; background:transparent;'
+        )
+        left.addWidget(title)
+
+        ver_lbl = QLabel(f'v{version}')
+        ver_lbl.setStyleSheet(
+            'color:#888899; font-size:12px; background:transparent;'
+        )
+        left.addWidget(ver_lbl)
+        left.addStretch()
+
+        top.addLayout(left)
+        top.addStretch()
+
+        # App icon on the right — prefer PNG for crisp rendering
+        icon_lbl = QLabel()
+        icon_lbl.setStyleSheet('background:transparent;')
+        for name in ('icon_256.png', 'icon_256.ico', 'icon.png', 'icon.ico'):
+            icon_path = base_path / 'assets' / name
+            if icon_path.exists():
+                pix = QPixmap(str(icon_path)).scaled(
+                    110, 110,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                if not pix.isNull():
+                    icon_lbl.setPixmap(pix)
+                    break
+        top.addWidget(icon_lbl)
+
+        root.addLayout(top)
+        root.addStretch()
+
+        # ── Status label (above the bottom bar) ──────────────────────────────
+        self._status_lbl = QLabel('Iniciando...')
+        self._status_lbl.setStyleSheet(
+            'color:#aaaacc; font-size:11px; background:transparent;'
+        )
+        root.addWidget(self._status_lbl)
+
+    def paintEvent(self, event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        # Background gradient
+        grad = QLinearGradient(0, 0, 0, self._H)
+        grad.setColorAt(0.0, QColor('#0d0d14'))
+        grad.setColorAt(1.0, QColor('#1c1c2e'))
+        p.fillRect(self.rect(), grad)
+
+        # Bottom bar: dark track + orange fill (progress)
+        bar_h = 4
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor('#2a2a3e'))
+        p.drawRect(0, self._H - bar_h, self._W, bar_h)
+        fill_w = int(self._W * self._progress / 100)
+        if fill_w > 0:
+            p.setBrush(QColor('#f5a623'))
+            p.drawRect(0, self._H - bar_h, fill_w, bar_h)
+
+        p.end()
+
+    def set_status(self, msg: str, progress: int = 0) -> None:
+        self._status_lbl.setText(msg)
+        self._progress = progress
+        self.update()
+        QApplication.processEvents()
+
+    def finish(self, _win=None) -> None:
+        self._progress = 100
+        self.update()
+        QApplication.processEvents()
+        self.close()
+        self.deleteLater()
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 def main():
     if not HAS_PYGAME:
@@ -5379,12 +5536,18 @@ def main():
     app.setApplicationName('DJ Mix Player')
 
     _base = Path(sys._MEIPASS) if hasattr(sys, '_MEIPASS') else Path(__file__).parent
+
+    splash = _SplashScreen(APP_VERSION, _base)
+    splash.show()
+    splash.set_status('Carregando fontes...', 5)
+
     _fonts_dir = _base / 'fonts' / 'static'
     for _ttf in _fonts_dir.glob('*.ttf'):
         QFontDatabase.addApplicationFont(str(_ttf))
 
-    win = MainWindow()
+    win = MainWindow(splash=splash)
     win.show()
+    splash.finish()
     sys.exit(app.exec())
 
 
